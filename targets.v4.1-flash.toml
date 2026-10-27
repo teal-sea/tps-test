@@ -1,0 +1,138 @@
+# DeepSeek-V4.1-Flash across providers.
+#
+# Curated from 41 advertised endpoints on 2026-10-27 — 3 quant classes
+# (fp4 / fp8 / unknown) and a 30x spread in input price. Prices below were
+# copied from the discover output and drift daily; re-run
+#   .venv/bin/python rig.py discover deepseek/deepseek-v4.1-flash --out targets.v4.1-flash.full.toml
+# for the current full list (36 pinnable rows).
+#
+# First pass, ~20 min and a few cents of spend:
+#   export OPENROUTER_API_KEY=...
+#   .venv/bin/python rig.py run -c targets.v4.1-flash.toml
+
+[run]
+reps = 7
+concurrency = [1, 4]
+warmup = 2
+temperature = 0.0
+timeout_s = 180
+prompts = ["prose-256"]
+
+# --- fp4 ----------------------------------------------------------------
+# Note the inversion: OpenInference is cheapest on input and nearly 3x
+# Decart on output. "Cheapest" depends entirely on your input:output ratio,
+# which is exactly why the rig reports both and computes $/request.
+
+[[targets]]
+name = "open-inference (fp4)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["open-inference"], allow_fallbacks = false, quantizations = ["fp4"] }
+price = { in_per_1m = 0.020, out_per_1m = 0.512 }
+
+[[targets]]
+name = "decart (fp4)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["decart"], allow_fallbacks = false, quantizations = ["fp4"] }
+price = { in_per_1m = 0.090, out_per_1m = 0.180 }
+
+# --- fp8 ----------------------------------------------------------------
+# DeepInfra appears twice on purpose: same weights, same provider, two
+# service tiers. Note the pin is the *tier slug* — pinning bare "deepinfra"
+# never matches a tier endpoint, so a tier row labelled loosely would quietly
+# measure the standard endpoint.
+
+[[targets]]
+name = "deepinfra flex (fp8)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["deepinfra/fp8/flex"], allow_fallbacks = false, quantizations = ["fp8"] }
+price = { in_per_1m = 0.112, out_per_1m = 0.336 }
+
+[[targets]]
+name = "deepinfra (fp8)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["deepinfra"], allow_fallbacks = false, quantizations = ["fp8"] }
+price = { in_per_1m = 0.140, out_per_1m = 0.420 }
+
+[[targets]]
+name = "morph (fp8)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["morph"], allow_fallbacks = false, quantizations = ["fp8"] }
+price = { in_per_1m = 0.069, out_per_1m = 0.600 }
+
+[[targets]]
+name = "nebius (fp8)"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["nebius"], allow_fallbacks = false, quantizations = ["fp8"] }
+price = { in_per_1m = 0.300, out_per_1m = 1.200 }
+
+# --- quantization unreported -------------------------------------------
+# These endpoints don't publish a quant level, so you cannot assume fp8.
+# Keep them in a separate mental bucket when comparing.
+
+[[targets]]
+name = "fireworks"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+# this pin hides fireworks/{spot,default,us} at $0.21-0.45/1M in
+extra_body.provider = { only = ["fireworks"], allow_fallbacks = false }
+price = { in_per_1m = 0.210, out_per_1m = 0.840 }
+
+[[targets]]
+name = "together"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["together"], allow_fallbacks = false }
+price = { in_per_1m = 0.300, out_per_1m = 1.200 }
+
+[[targets]]
+name = "google-vertex"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["google-vertex"], allow_fallbacks = false }
+price = { in_per_1m = 0.300, out_per_1m = 1.200 }
+
+# --- premium tier -------------------------------------------------------
+
+[[targets]]
+name = "baseten priority"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["baseten/fast"], allow_fallbacks = false }
+price = { in_per_1m = 0.600, out_per_1m = 2.400 }
+
+# --- control ------------------------------------------------------------
+# No pin. This is what you actually get by default, and the row that tells
+# you whether pinning is worth the effort at all.
+
+[[targets]]
+name = "openrouter auto"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { sort = "throughput" }
+
+# --- first-party baseline (uncomment if your account exposes this model id) ---
+# OpenRouter has no DeepSeek first-party row for this model, so the direct API
+# is the only way to get that baseline. Confirm the model id in your account.
+#
+# [[targets]]
+# name = "deepseek-direct"
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-v4.1-flash"
+# api_key_env = "DEEPSEEK_API_KEY"

@@ -1,0 +1,14 @@
+# virtualenv / tooling
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+
+# measurement output — never commit, may contain prompts
+runs/*
+!runs/.gitkeep
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

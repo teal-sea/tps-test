@@ -1,0 +1,30 @@
+# Offline demo: no network, no API keys. Produces plausible (fake) numbers so
+# you can see the report shape and sanity-check the harness itself.
+#   .venv/bin/python rig.py run -c targets.mock.toml --mock
+
+[run]
+reps = 6
+concurrency = [1, 4]
+warmup = 0
+prompts = ["prose-256"]
+
+[[targets]]
+name = "fast-provider"
+base_url = "http://localhost:0000"
+model = "demo-model"
+mock = { ttft = [0.21, 0.34], itl = [0.007, 0.011] }
+price = { in_per_1m = 0.26, out_per_1m = 0.38 }
+
+[[targets]]
+name = "mid-provider"
+base_url = "http://localhost:0000"
+model = "demo-model"
+mock = { ttft = [0.42, 0.61], itl = [0.014, 0.021] }
+price = { in_per_1m = 0.28, out_per_1m = 0.42 }
+
+[[targets]]
+name = "slow-provider"
+base_url = "http://localhost:0000"
+model = "demo-model"
+mock = { ttft = [0.85, 1.4], itl = [0.026, 0.041] }
+price = { in_per_1m = 0.35, out_per_1m = 0.60 }
