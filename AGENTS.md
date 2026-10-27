@@ -123,11 +123,13 @@ on it. `itl_n` / `first_content_n` give the sample count behind those medians;
 `tokens_per_chunk_median` reconciles ITL with tok/s.
 
 `run --dry-run` sends nothing and adds `dry_run: true`, `plan{requests,
-measured_requests, warmup_requests, in_tokens_est, out_tokens_max, cost_max_usd,
-unpriced[], est_minutes, assumed{tok_s, ttft_s}, targets[]}` and
-`missing_credentials[]` (exit 0 even when credentials are missing).
-`cost_max_usd` assumes every response hits `max_tokens` (an upper bound; `null`
-when no target has a price); `est_minutes` assumes the stated rate.
+measured_requests, warmup_requests, in_tokens_est, in_tokens_max, out_tokens_max,
+cost_max_usd, unpriced[], est_minutes, assumed{tok_s, ttft_s, template_tokens},
+targets[]}` and `missing_credentials[]` (exit 0 even when credentials are
+missing). `cost_max_usd` is an upper bound: every response at `max_tokens`, input
+at `in_tokens_max` (UTF-8 bytes + template allowance — chars/4 `in_tokens_est`
+undercounts CJK/code); `null` when no target has a price. `est_minutes` assumes
+the stated rate.
 
 `discover` adds `model`, `endpoints[]`, `config`, `targets`.
 `fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
@@ -166,7 +168,7 @@ tps fingerprint -c /tmp/t.toml --json | jq '.verdict, .clusters, .no_data'
 Don't estimate by hand: `tps run … --dry-run --json` returns the request count,
 worst-case cost and rough minutes for exactly the flags you pass. For scale: 11
 targets, 1 prompt, 7 reps, concurrency 1 and 4 = 385 measured + 22 warm-up
-requests ≈ 20 min, ≤ $0.09 at the cap (≈ $0.05 in practice). `fingerprint` ≈ 44
+requests ≈ 20 min, ≤ $0.10 worst case (≈ $0.05 in practice). `fingerprint` ≈ 44
 requests ≈ 1 min. Always dry-run a 41-target config first.
 
 ## Failure modes you will hit

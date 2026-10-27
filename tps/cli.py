@@ -850,8 +850,8 @@ def run_plan(
         "  "
         + ui.kv(
             "tokens",
-            f"≈{_k(plan['in_tokens_est'])} in (chars/4) · ≤{_k(plan['out_tokens_max'])} out "
-            "(max_tokens cap)",
+            f"≈{_k(plan['in_tokens_est'])} in (≤{_k(plan['in_tokens_max'])} by bytes) · "
+            f"≤{_k(plan['out_tokens_max'])} out (max_tokens cap)",
             width,
         )
     )
@@ -918,6 +918,11 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         # keep the flags as a config next to the results: repeatable, extendable
         outdir.mkdir(parents=True, exist_ok=True)
         path = outdir / "targets.toml"
+        if path.exists() and path.read_text(encoding="utf-8") != text:
+            # `-o .` next to a hand-written config must never replace it
+            raise core.UsageError(
+                f"{path} already exists and isn't this run's config — pick another -o"
+            )
         path.write_text(text, encoding="utf-8")
     total = core.planned_requests(cfg)
     ui.header("run", _models_label(cfg), mock=args.mock)

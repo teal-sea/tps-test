@@ -1001,6 +1001,43 @@ async def main() -> int:
             and core.load_config(saved).targets[0].base_url == base,
             str(one_payload.get("config")),
         )
+        mine = work / "handwritten"
+        mine.mkdir()
+        (mine / "targets.toml").write_text("# my hand-written config\n", encoding="utf-8")
+        before_seen = len(SEEN)
+        clobber = tps(
+            ["run", "--base-url", base, "--model", "test-model", "-o", "handwritten"], work
+        )
+        check(
+            "run --base-url never overwrites an existing config in -o (and sends nothing)",
+            clobber.returncode == 1
+            and (mine / "targets.toml").read_text(encoding="utf-8") == "# my hand-written config\n"
+            and len(SEEN) == before_seen,
+            clobber.stderr[-200:],
+        )
+        rerun = tps(
+            [
+                "run",
+                "--base-url",
+                base,
+                "--model",
+                "test-model",
+                "--name",
+                "direct",
+                "--price",
+                "0.1,0.2",
+                "--reps",
+                "1",
+                "-o",
+                "oneshot",
+            ],
+            work,
+        )
+        check(
+            "...but re-running into its own run dir is fine",
+            rerun.returncode == 0,
+            rerun.stderr[-200:],
+        )
         (work / "init-ep.toml").unlink(missing_ok=True)
         init_ep = tps(
             [
@@ -1124,6 +1161,23 @@ async def main() -> int:
             reserved.returncode == 1 and "extra_body can't set max_tokens" in reserved.stderr,
             reserved.stderr[-200:],
         )
+        (work / "reserved_run.toml").write_text(
+            '[run]\nmax_tokens_field = "max_output_tokens"\n\n'
+            + target_block("r", base, "test-model", "extra_body = { max_output_tokens = 4096 }"),
+            encoding="utf-8",
+        )
+        reserved_run = tps(["run", "-c", "reserved_run.toml", "--dry-run"], work)
+        check(
+            "...nor through a run-level max_tokens_field",
+            reserved_run.returncode == 1 and "max_output_tokens" in reserved_run.stderr,
+            reserved_run.stderr[-200:],
+        )
+        cjk = "请用中文详细解释TCP拥塞控制的工作原理，包括慢启动和拥塞避免。" * 20
+        check(
+            "dry-run input bound holds for CJK text, where chars/4 undercounts ~4x",
+            core.max_prompt_tokens(cjk) >= len(cjk) > 3 * core.estimate_tokens(cjk),
+            f"{core.max_prompt_tokens(cjk)} vs {len(cjk)} chars, est {core.estimate_tokens(cjk)}",
+        )
         (work / "fp_claude.toml").write_text(
             '[run]\nprompts = ["prose-256"]\n\n'
             + "".join(
@@ -1168,8 +1222,9 @@ async def main() -> int:
         plan_run = tps(["run", "-c", "plan.toml", "-o", "planned", "--dry-run", "--json"], work)
         plan_payload = json.loads(plan_run.stdout or "{}")
         plan = plan_payload.get("plan", {})
-        prompt_in = core.estimate_tokens(core.build_prompt(core.DEFAULT_PROMPTS["prose-256"]))
-        # priced target: 15 measured × (in + 256 out) + 1 warm-up × (in + 16 out)
+        prompt_in = core.max_prompt_tokens(core.build_prompt(core.DEFAULT_PROMPTS["prose-256"]))
+        # priced target: 15 measured × (in + 256 out) + 1 warm-up × (in + 16 out),
+        # input at its byte bound so the cost really is an upper bound
         expected = (16 * prompt_in * 1.0 + (15 * 256 + core.WARMUP_MAX_TOKENS) * 2.0) / 1e6
         check(
             "dry run: sends nothing, writes nothing, exits 0 despite a missing key",

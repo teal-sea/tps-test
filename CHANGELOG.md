@@ -51,7 +51,13 @@ First public release.
   credited to tok/s (up to 40% too fast), and a response whose hidden thinking
   used the whole cap was counted as a failed `empty_stream`.
 - `extra_body` could override the token cap, making `--dry-run` understate cost
-  and defeating the warm-up cap; tps-controlled fields are now rejected there.
+  and defeating the warm-up cap; tps-controlled fields are now rejected there,
+  including a field renamed by a run-level `max_tokens_field`.
+- `--dry-run` called its cost an upper bound while counting input as chars/4,
+  which undercounts CJK text and code up to 4×; input is now bounded by UTF-8
+  bytes (`in_tokens_max`).
+- `tps run --base-url -o DIR` overwrote an existing `DIR/targets.toml` (e.g. a
+  hand-written config with `-o .`); it now refuses before sending anything.
 - The fingerprint agreement box overflowed with only two targets.
 - A stream coalesced by a proxy showed a 1 ms ITL next to 138 tok/s with nothing
   saying why, and won "best ITL". Bursty delivery is now detected (median gap <

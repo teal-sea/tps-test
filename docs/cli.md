@@ -125,11 +125,15 @@ Cost model: requests = targets × prompts × reps × Σ(concurrency), plus
 `warmup` per target. A curated 11-target run at 1 prompt, 7 reps, concurrency
 1+4 is 385 measured requests + 22 warm-ups. Warm-ups are capped at 16 output
 tokens; they open connections and warm the prompt cache, then are discarded.
-`--dry-run` does this arithmetic for you: output tokens at the `max_tokens` cap
-(so the cost is an upper bound, and targets without a price are listed rather
-than guessed), input tokens as chars/4, and minutes at an assumed 40 tok/s and
-1 s TTFT. It validates the config and flags like a real run but does not
-require credentials — missing ones are listed in `missing_credentials`.
+`--dry-run` does this arithmetic for you, and its cost is a real upper bound:
+output tokens at the `max_tokens` cap, input tokens at the prompt's UTF-8 byte
+count + 32 for the chat template (no tokenizer produces more tokens than bytes;
+chars/4, shown as the typical count, undercounts CJK text or dense code up to
+4×). Targets without a price are listed rather than guessed, and minutes assume
+40 tok/s and 1 s TTFT. A provider that injects its own system prompt can still
+exceed the bound — nothing outside it can see that. It validates the config and
+flags like a real run but does not require credentials — missing ones are listed
+in `missing_credentials`.
 
 `raw.jsonl` is written as batches finish and `meta.json` up front (with
 `"complete": false` until the end). **Ctrl-C keeps everything measured so far**,
@@ -247,9 +251,9 @@ reconciles ITL with tok/s.
  "config":"targets.toml","model":"deepseek/deepseek-v4.1-flash",
  "reps":7,"concurrency":[1,4],"prompts":["prose-256"],
  "plan":{"requests":407,"measured_requests":385,"warmup_requests":22,
-   "in_tokens_est":24376,"out_tokens_max":98912,
-   "cost_max_usd":0.0847,"unpriced":["openrouter auto"],
-   "est_minutes":19.5,"assumed":{"tok_s":40.0,"ttft_s":1.0},
+   "in_tokens_est":24420,"in_tokens_max":110297,"out_tokens_max":98912,
+   "cost_max_usd":0.1014,"unpriced":["openrouter auto"],
+   "est_minutes":19.5,"assumed":{"tok_s":40.0,"ttft_s":1.0,"template_tokens":32},
    "targets":[{"target":"deepinfra (fp8)","requests":37,"cost_max_usd":0.0045}]},
  "missing_credentials":[]}
 ```

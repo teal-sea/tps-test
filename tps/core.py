@@ -382,11 +382,9 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
         if api not in APIS:
             raise UsageError(f"{path}: {label}: `api` must be one of {', '.join(APIS)}")
         extra_body = _table(entry, "extra_body", label, path)
-        reserved = sorted(
-            k
-            for k in extra_body
-            if k in RESERVED_BODY or k == (entry.get("max_tokens_field") or "max_tokens")
-        )
+        # the token-cap field can be renamed per target or for the whole run
+        cap_fields = {entry.get("max_tokens_field"), run.get("max_tokens_field")}
+        reserved = sorted(k for k in extra_body if k in RESERVED_BODY or k in cap_fields)
         if reserved:
             raise UsageError(
                 f"{path}: {label}: extra_body can't set {', '.join(reserved)} — tps sends "
@@ -896,25 +894,41 @@ def planned_requests(cfg: RunConfig) -> int:
 # rates differ 10x between providers: the result is a budget, not a forecast.
 PLAN_TOK_S = 40.0
 PLAN_TTFT_S = 1.0
+# chat-template tokens a provider wraps around one user message; a provider
+# that injects its own system prompt can exceed this, and nothing can see that
+PLAN_TEMPLATE_TOKENS = 32
+
+
+def max_prompt_tokens(text: str) -> int:
+    """An upper bound on a prompt's input tokens, whatever the tokenizer.
+
+    Every BPE/SentencePiece token covers at least one UTF-8 byte, so a prompt
+    can't tokenize to more tokens than it has bytes. chars/4 is the typical
+    count for English but undercounts CJK text or dense code up to 4x.
+    """
+    return len(text.encode("utf-8")) + PLAN_TEMPLATE_TOKENS
 
 
 def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
     """What `execute` would send — counted the same way, nothing sent.
 
-    Output tokens are the max_tokens cap (an upper bound, hence `cost_max_usd`);
-    input tokens are a chars/4 estimate of each prompt.
+    `cost_max_usd` is a true upper bound: output at the max_tokens cap, input
+    at `max_prompt_tokens`. `in_tokens_est` (chars/4) is the typical count.
     """
     warm_spec = next(iter(cfg.prompts.values()))
     warm_out = min(int(warm_spec.get("max_tokens", 256)), WARMUP_MAX_TOKENS)
-    warm_in = estimate_tokens(build_prompt(warm_spec))
+    warm_text = build_prompt(warm_spec)
     measured_per_target = cfg.reps * sum(cfg.concurrency) * len(cfg.prompts)
-    in_tokens = cfg.warmup * warm_in
+    in_tokens = cfg.warmup * estimate_tokens(warm_text)
+    in_tokens_max = cfg.warmup * max_prompt_tokens(warm_text)
     out_tokens = cfg.warmup * warm_out
     seconds = cfg.warmup * (PLAN_TTFT_S + warm_out / PLAN_TOK_S)
     for spec in cfg.prompts.values():
         cap = int(spec.get("max_tokens", 256))
         requests = cfg.reps * sum(cfg.concurrency)
-        in_tokens += requests * estimate_tokens(build_prompt(spec))
+        text = build_prompt(spec)
+        in_tokens += requests * estimate_tokens(text)
+        in_tokens_max += requests * max_prompt_tokens(text)
         out_tokens += requests * cap
         # batches run one after another; a concurrent batch lasts ~one request
         seconds += cfg.reps * len(cfg.concurrency) * (PLAN_TTFT_S + cap / PLAN_TOK_S)
@@ -923,7 +937,9 @@ def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
     for target in cfg.targets:
         priced = target.price_in is not None and target.price_out is not None
         cost = (
-            (in_tokens * target.price_in + out_tokens * target.price_out) / 1e6 if priced else None
+            (in_tokens_max * target.price_in + out_tokens * target.price_out) / 1e6
+            if priced
+            else None
         )
         targets.append(
             {
@@ -938,11 +954,16 @@ def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
         "measured_requests": measured_per_target * len(cfg.targets),
         "warmup_requests": cfg.warmup * len(cfg.targets),
         "in_tokens_est": in_tokens * len(cfg.targets),
+        "in_tokens_max": in_tokens_max * len(cfg.targets),
         "out_tokens_max": out_tokens * len(cfg.targets),
         "cost_max_usd": sum(costs) if costs else None,
         "unpriced": [t["target"] for t in targets if t["cost_max_usd"] is None],
         "est_minutes": round(seconds * len(cfg.targets) / 60, 1),
-        "assumed": {"tok_s": PLAN_TOK_S, "ttft_s": PLAN_TTFT_S},
+        "assumed": {
+            "tok_s": PLAN_TOK_S,
+            "ttft_s": PLAN_TTFT_S,
+            "template_tokens": PLAN_TEMPLATE_TOKENS,
+        },
         "targets": targets,
     }
 
