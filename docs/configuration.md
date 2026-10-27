@@ -9,9 +9,9 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 |---|---|---|
 | `reps` | `7` | repetitions per prompt × concurrency × target |
 | `concurrency` | `[1]` | list of parallel-request levels |
-| `warmup` | `2` | discarded requests per target (TLS, cold start) |
-| `temperature` | `0.0` | keep at 0 for comparability |
-| `timeout_s` | `180` | per-request read timeout |
+| `warmup` | `2` | discarded requests per target (TLS, cold start), capped at 16 output tokens |
+| `temperature` | `0.0` | keep at 0 for comparability; `--temperature` overrides |
+| `timeout_s` | `180` | per-request read timeout; `--timeout` overrides |
 | `prompts` | your `[prompts.*]`, else the first two built-ins | any built-in or `[prompts.*]` name |
 | `baseline` | none | target name to compute Δ columns against (must exist) |
 | `max_tokens_field` | `max_tokens` | use `max_completion_tokens` for GPT-5/o-series |

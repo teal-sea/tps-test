@@ -19,6 +19,13 @@ For reasoning models the report adds a **first answer** column: time to the firs
 *content* chunk, i.e. when a user would see the answer start. It only appears
 when it differs from TTFT.
 
+A reasoning model can spend its entire `max_tokens` thinking and never answer
+(`finish_reason: "length"`, no content chunks). Its TTFT and tok/s are then real
+measurements *of the thinking*, and first answer and ITL have nothing to time.
+`tps` counts these responses (`reasoning_only`, next to `truncated` for any
+response stopped by the cap) and says so under the table — *measured thinking,
+not answering* — instead of leaving a bare `—`. Raise `--max-tokens`.
+
 TTFT includes your DNS, TLS, network RTT, queueing, and prefill. It is therefore a
 measure of *your* experience, not a property of the model alone.
 

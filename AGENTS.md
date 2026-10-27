@@ -35,11 +35,18 @@ library API — drive it as a subprocess and parse `--json`.
 ```bash
 tps doctor      [-c FILE] [--network]              # environment + credentials
 tps init        [--model SLUG] [--out FILE] [--force]
+tps init        --endpoint URL --model ID [--api-key-env VAR] [--name N] [--price IN,OUT]
 tps discover    MODEL [--out FILE] [--from-json F] [--json-out F]
-tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b] [--mock]
+tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b]
+                [--max-tokens N] [--temperature T] [--timeout S] [--dry-run] [--mock]
+tps run         --base-url URL --model ID [--api-key-env VAR] [--price IN,OUT] [...]
 tps report      RUN_DIR [--markdown]
-tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--mock]
+tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--timeout S] [--mock]
 ```
+
+`--base-url` measures one OpenAI-compatible endpoint with no config file (not
+with `-c`); the generated config is saved as `<run_dir>/targets.toml`.
+`discover` and `init --model` are OpenRouter-only; everything else is not.
 
 Global: `--json`, `--no-color`, `-q`, `-v`, `--version`. May appear before or
 after the subcommand. Config defaults to `targets.toml`, then
@@ -81,16 +88,35 @@ on **stdout** and exit non-zero.
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
     "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
+    "truncated": 7, "reasoning_only": 0, "notes": [],
     "ok": 35, "n": 35, "errors": {},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {"1": {"ok": 7, "n": 7, "...": "..."}, "4": {"ok": 28, "n": 28, "...": "..."}},
     "count_source": ["usage"], "served_by": ["DeepInfra"],
     "price_in_per_1m": 0.14, "price_out_per_1m": 0.42
   }],
-  "failed": 0, "total": 385, "mock": false,
+  "failed": 0, "total": 385, "warmup_requests": 22, "planned_requests": 407, "mock": false,
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
 ```
+
+Counts: `total` = measured requests; `warmup_requests` were sent first and
+discarded; `planned_requests` = both. `raw.jsonl` rows carry
+`"phase": "warmup"|"measure"`.
+
+`reasoning_only` > 0 means responses had no answer text — usually a reasoning
+model that hit `max_tokens` while thinking (`truncated` counts
+`finish_reason: "length"`, which the built-in prompts reach by design). Then
+`first_content_p50_s`/`itl_p50_ms` are null and TTFT/tok/s time the *thinking*;
+`notes` says so. Re-run with a larger `--max-tokens`; don't report those rates as
+answer speed.
+
+`run --dry-run` sends nothing and adds `dry_run: true`, `plan{requests,
+measured_requests, warmup_requests, in_tokens_est, out_tokens_max, cost_max_usd,
+unpriced[], est_minutes, assumed{tok_s, ttft_s}, targets[]}` and
+`missing_credentials[]` (exit 0 even when credentials are missing).
+`cost_max_usd` assumes every response hits `max_tokens` (an upper bound; `null`
+when no target has a price); `est_minutes` assumes the stated rate.
 
 `discover` adds `model`, `endpoints[]`, `config`, `targets`.
 `fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
@@ -109,7 +135,14 @@ always the slow tail**: `out_tps_p90 ≤ out_tps_p50`.
 **"Is provider X actually better?"**
 ```bash
 tps discover <model> --out /tmp/t.toml --json | jq '.endpoints | sort_by(.price_out_per_1m)[:5]'
+tps run -c /tmp/t.toml --reps 7 --dry-run --json | jq '.plan | {requests, cost_max_usd, est_minutes}'
 tps run -c /tmp/t.toml --reps 7 --json | jq '.results | sort_by(-.out_tps_p50) | .[:3] | .[] | {target, out_tps_p50, ttft_p50_s}'
+```
+
+**"How fast is this endpoint?"** (not on OpenRouter)
+```bash
+tps run --base-url https://api.example.com/v1 --model <id> --api-key-env VAR --json \
+  | jq '.results[] | {ttft_p50_s, out_tps_p50, itl_p50_ms, reasoning_only, notes}'
 ```
 
 **"Is the cheap one the same model?"**
@@ -119,13 +152,17 @@ tps fingerprint -c /tmp/t.toml --json | jq '.verdict, .clusters, .no_data'
 
 ## Cost and time
 
-`run` with 11 targets, 1 prompt, 7 reps, concurrency 1 and 4 ≈ 385 requests ≈
-20 min ≈ $0.05 of tokens. `fingerprint` ≈ 44 requests ≈ 1 min. Always estimate
-before running a 41-target config.
+Don't estimate by hand: `tps run … --dry-run --json` returns the request count,
+worst-case cost and rough minutes for exactly the flags you pass. For scale: 11
+targets, 1 prompt, 7 reps, concurrency 1 and 4 = 385 measured + 22 warm-up
+requests ≈ 20 min, ≤ $0.09 at the cap (≈ $0.05 in practice). `fingerprint` ≈ 44
+requests ≈ 1 min. Always dry-run a 41-target config first.
 
 ## Failure modes you will hit
 
-- `missing credentials` (2) — the env var in `api_key_env` isn't set.
+- `missing credentials` (2) — the env var in `api_key_env` (`--api-key-env`) isn't set.
+- A row with `reasoning_only == ok` — the model never answered inside
+  `max_tokens`; see above.
 - `HTTP 404` on a pin — the provider slug is wrong or the model moved; re-run `discover`.
 - Everything timing out — check egress/proxy; `tps doctor --network`.
 - Mock data — `"mock": true` in `meta.json`; never report it as a measurement.

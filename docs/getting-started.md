@@ -34,7 +34,24 @@ No key yet? See the whole pipeline offline first:
 tps run -c targets.mock.toml --mock      # synthetic numbers, flagged MOCK DATA
 ```
 
-## 2. Get a provider list for your model
+## 2. Point it at an endpoint
+
+**Your own endpoint, no config file** — any OpenAI-compatible API (a vendor's
+own platform, a token plan, vLLM on a box under your desk):
+
+```bash
+export EXAMPLE_API_KEY=sk-...
+tps run --base-url https://api.example.com/v1 --model some-model-id \
+        --api-key-env EXAMPLE_API_KEY --price 0.30,1.20 --dry-run
+```
+
+`--dry-run` prints the requests, tokens, worst-case cost and rough time, and
+sends nothing; drop it to measure. `--price` (USD per 1M input,output tokens) is
+optional and only fills the cost columns. The run saves the generated config as
+`runs/<timestamp>/targets.toml`; `tps init --endpoint … --model …` writes the same
+file up front, ready for more `[[targets]]` blocks.
+
+**Every provider of a model, via OpenRouter:**
 
 ```bash
 tps discover deepseek/deepseek-v4.1-flash --out targets.toml
@@ -69,6 +86,7 @@ the target. OpenRouter is convenient because one key reaches every upstream.
 ## 4. Measure
 
 ```bash
+tps run -c targets.toml --dry-run    # what it will cost first; nothing sent
 tps run -c targets.toml
 ```
 
@@ -114,6 +132,9 @@ different. See [fingerprinting](fingerprinting.md).
   rate limiting, not slowness — the under-load table shows it per level.
 - **Check `out tok`.** A provider that stops early looks fast. The report prints
   the median; compare it before comparing speed.
+- **Reasoning models need room.** If a row warns *measured thinking, not
+  answering*, the model spent its whole `max_tokens` reasoning: TTFT and tok/s are
+  real but time the thinking, and there is no ITL. Re-run with `--max-tokens 2048`.
 - **Check your own noise first.** Two consecutive runs of the same config tell you
   more than any single p90.
 

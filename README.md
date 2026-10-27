@@ -56,9 +56,16 @@ tps run -c targets.v4.1-flash.toml           # the measurement
 tps fingerprint -c targets.v4.1-flash.toml   # same weights, or just the same name?
 ```
 
-Your own model: `tps init --model <author>/<slug>` writes one pinned target per
-provider into `targets.toml`. That can be 40+ targets, so start with
-`tps run --reps 3 --concurrency 1`; the header prints the request count.
+Your own endpoint, no OpenRouter and no config file:
+
+```bash
+tps run --base-url https://api.example.com/v1 --model <id> --api-key-env EXAMPLE_API_KEY --dry-run
+```
+
+Every provider of your model: `tps init --model <author>/<slug>` writes one
+pinned target per OpenRouter endpoint into `targets.toml`. That can be 40+
+targets — `tps run --dry-run` prints the requests, worst-case cost and rough time
+before anything is sent.
 
 Python 3.11+. One dependency (`httpx`); `pipx install ".[http2]"` adds HTTP/2.
 Any OpenAI-compatible endpoint works — OpenRouter is just the easiest way to

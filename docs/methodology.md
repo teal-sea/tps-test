@@ -26,9 +26,11 @@ instead of landing on whoever went first.
 
 ## 4. Warm up, then discard
 
-Two warm-up requests per target establish TLS, HTTP/2 and any provider-side cold
-start, and are excluded from the statistics (they stay in `raw.jsonl` as
-`batch: -1`).
+Two warm-up requests per target establish TLS, HTTP/2, the provider's prompt
+cache and any cold start, and are excluded from the statistics (they stay in
+`raw.jsonl` as `"phase": "warmup"`, `batch: -1`). They send the first prompt but
+are capped at 16 output tokens: a full-length answer that is thrown away would
+only cost money.
 
 ## 5. Run it twice a day
 

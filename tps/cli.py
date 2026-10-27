@@ -31,8 +31,9 @@ CONFIG_CANDIDATES = ("targets.toml", "targets.gateway.toml")
 
 STARTER_CONFIG = """\
 # tps config — one [[targets]] block per upstream you want to measure.
-# Generate the whole list for a model instead of typing it:
-#   tps discover <author>/<slug> --out targets.toml
+# Generate it instead of typing it:
+#   tps init --endpoint https://api.example.com/v1 --model ID --api-key-env VAR
+#   tps discover <author>/<slug> --out targets.toml      (every OpenRouter endpoint)
 
 [run]
 reps = 7
@@ -98,9 +99,54 @@ def require_keys(cfg: core.RunConfig) -> None:
         envs = sorted({t.api_key_env for t in missing if t.api_key_env})
         raise core.MissingKeyError(
             f"missing credentials for: {', '.join(t.name for t in missing)}"
-            + (f" — set {', '.join(envs)}" if envs else "")
+            + (
+                f" — set {', '.join(envs)}"
+                if envs
+                else " — name the env var that holds the key (api_key_env, or --api-key-env)"
+            )
             + " (or run with --mock)"
         )
+
+
+def _price_pair(text: str | None) -> tuple[float, float] | None:
+    if text is None:
+        return None
+    try:
+        price_in, price_out = (float(p) for p in text.split(","))
+    except ValueError:
+        raise core.UsageError(
+            f"--price takes IN,OUT in USD per 1M tokens, e.g. 0.14,0.42 — got {text!r}"
+        ) from None
+    if price_in < 0 or price_out < 0:
+        raise core.UsageError("--price cannot be negative")
+    return price_in, price_out
+
+
+def endpoint_config(url: str | None, args: argparse.Namespace, flag: str) -> str | None:
+    """A one-target config from flags, for endpoints no gateway lists.
+
+    Returns None when `flag` wasn't given, after rejecting the flags that
+    only make sense with it.
+    """
+    extras = {"--api-key-env": args.api_key_env, "--name": args.name, "--price": args.price}
+    if flag == "--base-url":
+        extras["--model"] = args.model
+    if url is None:
+        stray = [name for name, value in extras.items() if value is not None]
+        if stray:
+            verb = "needs" if len(stray) == 1 else "need"
+            raise core.UsageError(f"{', '.join(stray)} {verb} {flag} (or set it in a config)")
+        return None
+    if not args.model:
+        raise core.UsageError(f"{flag} needs --model — the model id that endpoint serves")
+    return core.endpoint_toml(
+        url,
+        args.model,
+        args.name,
+        args.api_key_env,
+        _price_pair(args.price),
+        source=f"tps {args.command} {flag}",
+    )
 
 
 def check_mock(cfg: core.RunConfig, path: Path, mock: bool, ui: UI) -> None:
@@ -137,6 +183,14 @@ def apply_overrides(cfg: core.RunConfig, args: argparse.Namespace) -> None:
                 f"unknown prompt(s) {unknown}; have {sorted(cfg.available_prompts)}"
             )
         cfg.prompts = {p: cfg.available_prompts[p] for p in wanted}
+    if getattr(args, "max_tokens", None) is not None:
+        cfg.prompts = {
+            name: {**spec, "max_tokens": args.max_tokens} for name, spec in cfg.prompts.items()
+        }
+    if getattr(args, "temperature", None) is not None:
+        cfg.temperature = args.temperature
+    if getattr(args, "timeout", None) is not None:
+        cfg.timeout_s = args.timeout
     if getattr(args, "no_warmup", False):
         cfg.warmup = 0
     core.validate(cfg, "flags")
@@ -191,6 +245,9 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "itl_p50_ms": _r(st["itl_p50_ms"], 2),
                 "e2e_p50_s": _r(st["e2e_p50_s"]),
                 "out_tokens_median": st["out_tokens_median"],
+                "truncated": st["truncated"],
+                "reasoning_only": st["reasoning_only"],
+                "notes": [note] if (note := core.reasoning_note(st)) else [],
                 "ok": total["ok"],
                 "n": total["n"],
                 "errors": total["errors"],
@@ -297,6 +354,12 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
         legend += " · ≈ chars/4 estimate"
     ui.say()
     ui.table(cols, table, title=title, footer=legend)
+    for r in rows:
+        for note in r["notes"]:
+            first, *rest = _wrap(f"{r['target']}: {note}", ui.width - 6)
+            ui.warn(first)
+            for line in rest:
+                ui.say("    " + line)
 
 
 def print_load_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
@@ -610,8 +673,23 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     if out.exists() and not args.force:
         raise core.UsageError(f"{out} exists — pass --force to overwrite")
 
+    text = endpoint_config(args.endpoint_url, args, "--endpoint")
     ui.header("init")
     ui.say()
+    if text is not None:
+        core.config_from_text(text, "--endpoint")  # same checks as loading it later
+        out.write_text(text, encoding="utf-8")
+        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} at {args.endpoint_url}")
+        export = f"export {args.api_key_env}=… && " if args.api_key_env else ""
+        ui.hint(f"  next → {export}tps run -c {out} --dry-run   (then without --dry-run)")
+        return {
+            "command": "init",
+            "ok": True,
+            "config": str(out),
+            "model": args.model,
+            "targets": 1,
+            "endpoint": args.endpoint_url,
+        }
     if args.model:
         canonical, endpoints, _payload = core.fetch_endpoints(
             args.model, os.environ.get("OPENROUTER_API_KEY")
@@ -632,8 +710,9 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     out.write_text(STARTER_CONFIG, encoding="utf-8")
     ui.ok(f"wrote {ui.bold(str(out))} (starter template)")
     ui.hint(f"  next → edit the targets, then: tps doctor && tps run -c {out}")
+    ui.hint("  or generate one: tps init --endpoint URL --model ID --api-key-env VAR --force")
     ui.hint(
-        "  or generate one for a real model: tps init --model deepseek/deepseek-v4.1-flash --force"
+        "               or: tps init --model deepseek/deepseek-v4.1-flash --force  (OpenRouter)"
     )
     return {"command": "init", "ok": True, "config": str(out), "model": None, "targets": 0}
 
@@ -718,15 +797,105 @@ def _models_label(cfg: core.RunConfig) -> str:
     return models[0] if len(models) == 1 else f"{len(models)} model ids"
 
 
+def _k(tokens: int) -> str:
+    return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+
+
+def run_plan(
+    ui: UI, cfg: core.RunConfig, path: Path | None, args: argparse.Namespace
+) -> dict[str, Any]:
+    """`tps run --dry-run`: the bill before the run. Nothing is sent."""
+    plan = core.plan_run(cfg, mock=args.mock)
+    missing = [] if args.mock else [t.name for t in cfg.targets if t.needs_key()]
+    ui.header("run", f"{_models_label(cfg)} · dry run", mock=args.mock)
+    ui.hint(
+        f"  {_n(len(cfg.targets), 'target')} · {_n(len(cfg.prompts), 'prompt')} · "
+        f"{_n(cfg.reps, 'rep')} · concurrency {','.join(map(str, cfg.concurrency))}"
+    )
+    ui.say()
+    width = 12
+    ui.say(
+        "  "
+        + ui.kv(
+            "requests",
+            f"{plan['requests']} ({plan['measured_requests']} measured + "
+            f"{plan['warmup_requests']} warm-up)",
+            width,
+        )
+    )
+    ui.say(
+        "  "
+        + ui.kv(
+            "tokens",
+            f"≈{_k(plan['in_tokens_est'])} in (chars/4) · ≤{_k(plan['out_tokens_max'])} out "
+            "(max_tokens cap)",
+            width,
+        )
+    )
+    if args.mock:
+        cost = "$0 — --mock sends nothing"
+    elif plan["cost_max_usd"] is None:
+        cost = "unknown — no target has a price (price = { … } or --price)"
+    else:
+        spend = plan["cost_max_usd"]
+        cost = f"≤ ${spend:.4f}" if spend < 1 else f"≤ ${spend:,.2f}"
+        if plan["unpriced"]:
+            cost += f" + unpriced: {', '.join(plan['unpriced'])}"
+    ui.say("  " + ui.kv("cost", cost, width))
+    assumed = plan["assumed"]
+    ui.say(
+        "  "
+        + ui.kv(
+            "time",
+            f"≈{plan['est_minutes']:g} min at an assumed {assumed['tok_s']:g} tok/s and "
+            f"{assumed['ttft_s']:g}s TTFT",
+            width,
+        )
+    )
+    if missing:
+        names = ", ".join(missing[:4]) + (f" +{len(missing) - 4} more" if len(missing) > 4 else "")
+        ui.say()
+        ui.warn(f"missing credentials for {names} — the real run would exit 2")
+    ui.say()
+    ui.hint("  nothing was sent · drop --dry-run to run it")
+    return {
+        "command": "run",
+        "ok": True,
+        "dry_run": True,
+        "mock": args.mock,
+        "config": str(path) if path else None,
+        "model": cfg.targets[0].model,
+        "reps": cfg.reps,
+        "concurrency": cfg.concurrency,
+        "prompts": list(cfg.prompts),
+        "plan": plan,
+        "missing_credentials": missing,
+    }
+
+
 def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
-    path = resolve_config(args.config)
-    cfg = core.load_config(path)
+    if args.endpoint_url and args.config:
+        raise core.UsageError("pass either -c FILE or --base-url, not both")
+    text = endpoint_config(args.endpoint_url, args, "--base-url")
+    if text is None:
+        path: Path | None = resolve_config(args.config)
+        cfg = core.load_config(path)
+    else:
+        path = None
+        cfg = core.config_from_text(text, "--base-url")
     apply_overrides(cfg, args)
-    check_mock(cfg, path, args.mock, ui)
+    check_mock(cfg, path or Path("--base-url"), args.mock, ui)
+    if args.dry_run:
+        return run_plan(ui, cfg, path, args)
     if not args.mock:
         require_keys(cfg)
 
     outdir = args.out or Path("runs") / stamp()
+    if text is not None:
+        # keep the flags as a config next to the results: repeatable, extendable
+        outdir.mkdir(parents=True, exist_ok=True)
+        path = outdir / "targets.toml"
+        path.write_text(text, encoding="utf-8")
     total = core.planned_requests(cfg)
     ui.header("run", _models_label(cfg), mock=args.mock)
     ui.hint(
@@ -752,7 +921,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             kept = 0
             try:
                 partial, meta = core.load_samples(outdir)
-                kept = sum(1 for s in partial if s.get("batch") != -1)
+                kept = sum(1 for s in partial if not core.is_warmup(s))
                 if kept:
                     core.write_report(outdir, partial, meta)
             except core.TpsError:
@@ -768,7 +937,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     summary = summarise(rows, meta)
     render_run(ui, summary, list(cfg.prompts))
 
-    measured = [s for s in samples if s.batch != -1]
+    measured = [s for s in samples if s.phase != "warmup"]
     failed = sum(1 for s in measured if not s.ok)
     ui.say()
     if failed:
@@ -790,7 +959,10 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "concurrency": cfg.concurrency,
         "results": summary["rows"],
         "failed": failed,
+        # `total` is measured requests only; raw.jsonl also holds the warm-ups
         "total": len(measured),
+        "warmup_requests": len(samples) - len(measured),
+        "planned_requests": core.planned_requests(cfg),
         # partial failure is data, not a usage error: it shows up in `failed`
         "exit_code": 4 if measured and failed == len(measured) else 0,
         "artifacts": {
@@ -834,6 +1006,9 @@ def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     ):
         if value < 1:
             raise core.UsageError(f"{flag} must be at least 1 (got {value})")
+    if args.timeout is not None:
+        cfg.timeout_s = args.timeout
+        core.validate(cfg, "flags")
     check_mock(cfg, path, args.mock, ui)
     if not args.mock:
         require_keys(cfg)
@@ -919,13 +1094,34 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS)
         p.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
 
+    def endpoint_flags(p: argparse.ArgumentParser, flag: str) -> None:
+        p.add_argument(
+            flag,
+            dest="endpoint_url",
+            default=None,
+            metavar="URL",
+            help="any OpenAI-compatible base URL, e.g. https://api.example.com/v1 — no config file",
+        )
+        p.add_argument(
+            "--model",
+            default=None,
+            help=(
+                "model id at that endpoint"
+                if flag == "--base-url"
+                else f"with {flag}: the model id there; alone: OpenRouter slug to discover"
+            ),
+        )
+        p.add_argument("--api-key-env", default=None, help="env var holding the key")
+        p.add_argument("--name", default=None, help="target name (default: the host)")
+        p.add_argument("--price", default=None, metavar="IN,OUT", help="USD per 1M tokens")
+
     p_doctor = sub.add_parser("doctor", help="check environment, config and credentials")
     p_doctor.add_argument("-c", "--config", type=Path, default=None)
     p_doctor.add_argument("--network", action="store_true", help="also probe base URLs")
     common(p_doctor)
 
     p_init = sub.add_parser("init", help="scaffold a config")
-    p_init.add_argument("--model", default=None, help="generate pinned targets for a model")
+    endpoint_flags(p_init, "--endpoint")
     p_init.add_argument("--out", type=Path, default=Path("targets.toml"))
     p_init.add_argument("--force", action="store_true")
     common(p_init)
@@ -941,9 +1137,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="measure throughput and latency")
     p_run.add_argument("-c", "--config", type=Path, default=None)
     p_run.add_argument("-o", "--out", type=Path, default=None)
+    p_run.add_argument(
+        "--dry-run", action="store_true", help="print requests, tokens, cost and time; send nothing"
+    )
+    endpoint_flags(p_run, "--base-url")
     p_run.add_argument("--reps", type=int, default=None)
     p_run.add_argument("--concurrency", default=None, help="e.g. 1,4,16")
     p_run.add_argument("--prompts", default=None, help="comma separated prompt names")
+    p_run.add_argument(
+        "--max-tokens", type=int, default=None, help="override every prompt's max_tokens"
+    )
+    p_run.add_argument("--temperature", type=float, default=None)
+    p_run.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
     p_run.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
     p_run.add_argument("--no-warmup", action="store_true")
     common(p_run)
@@ -959,6 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--max-tokens", type=int, default=160)
     p_fp.add_argument("--reps", type=int, default=2)
     p_fp.add_argument("--prompt-count", type=int, default=2, help="how many prompts to probe")
+    p_fp.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
     p_fp.add_argument("--mock", action="store_true", help="synthetic fingerprints, no network")
     common(p_fp)
 

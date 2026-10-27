@@ -260,8 +260,17 @@ def validate(cfg: RunConfig, where: str = "config") -> None:
         raise UsageError(f"{where}: warmup cannot be negative")
     if cfg.timeout_s <= 0:
         raise UsageError(f"{where}: timeout_s must be positive")
+    if cfg.temperature < 0:
+        raise UsageError(f"{where}: temperature cannot be negative")
     if not cfg.prompts:
         raise UsageError(f"{where}: no prompts selected")
+    for name, spec in cfg.prompts.items():
+        try:
+            capped = int(spec.get("max_tokens", 256)) >= 1
+        except (TypeError, ValueError):
+            capped = False
+        if not capped:
+            raise UsageError(f"{where}: prompt {name!r}: max_tokens must be an integer ≥ 1")
     names = [t.name for t in cfg.targets]
     if cfg.baseline and cfg.baseline not in names:
         raise UsageError(
@@ -295,7 +304,15 @@ def load_config(path: Path) -> RunConfig:
             raw = tomllib.load(handle)
     except tomllib.TOMLDecodeError as exc:
         raise UsageError(f"{path}: invalid TOML — {exc}") from exc
+    return config_from_dict(raw, path)
 
+
+def config_from_text(text: str, label: str) -> RunConfig:
+    """A config built in memory (`--base-url` mode), validated like a file."""
+    return config_from_dict(tomllib.loads(text), Path(label))
+
+
+def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
     run = raw.get("run", {}) or {}
     target_dicts = raw.get("targets") or []
     if not target_dicts:
@@ -403,6 +420,9 @@ class Sample:
     served_by: str | None = None
     batch_wall_s: float | None = None
     wall_clock: str = ""
+    phase: str = "measure"  # "warmup" rows are discarded by every statistic
+    finish_reason: str | None = None  # "length" = stopped by max_tokens
+    reasoning_tokens: int | None = None  # from usage.completion_tokens_details
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -548,6 +568,8 @@ async def stream_once(
                 choices = obj.get("choices") or []
                 if not choices or not isinstance(choices[0], dict):
                     continue
+                if choices[0].get("finish_reason"):
+                    sample.finish_reason = str(choices[0]["finish_reason"])
                 delta = choices[0].get("delta") or {}
                 piece = delta.get("content") or ""
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
@@ -590,6 +612,9 @@ async def stream_once(
             usage.get("completion_tokens"), usage.get("output_tokens")
         )
         sample.in_tokens = _first_present(usage.get("prompt_tokens"), usage.get("input_tokens"))
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            sample.reasoning_tokens = details.get("reasoning_tokens")
     if sample.out_tokens is None and chars:
         sample.out_tokens = max(1, round(chars / 4))
         estimated = True
@@ -704,6 +729,7 @@ def mock_sample(
         served_by=target.note() or "mock",
         batch_wall_s=ttft + decode,
         wall_clock=now_iso(),
+        finish_reason="length" if tokens == max_tokens else "stop",
     )
 
 
@@ -719,10 +745,70 @@ def rotate(items: list[Any], n: int) -> list[Any]:
     return items[n:] + items[:n]
 
 
+# Warm-ups only open connections and warm the provider's prompt cache, and are
+# discarded; generating a full-length answer for them would just cost money.
+WARMUP_MAX_TOKENS = 16
+
+
 def planned_requests(cfg: RunConfig) -> int:
     """targets × prompts × reps × Σ(concurrency), plus warm-ups."""
     measured = len(cfg.targets) * len(cfg.prompts) * cfg.reps * sum(cfg.concurrency)
     return measured + len(cfg.targets) * cfg.warmup
+
+
+# `--dry-run` turns requests into minutes at an assumed per-stream rate. Real
+# rates differ 10x between providers: the result is a budget, not a forecast.
+PLAN_TOK_S = 40.0
+PLAN_TTFT_S = 1.0
+
+
+def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
+    """What `execute` would send — counted the same way, nothing sent.
+
+    Output tokens are the max_tokens cap (an upper bound, hence `cost_max_usd`);
+    input tokens are a chars/4 estimate of each prompt.
+    """
+    warm_spec = next(iter(cfg.prompts.values()))
+    warm_out = min(int(warm_spec.get("max_tokens", 256)), WARMUP_MAX_TOKENS)
+    warm_in = estimate_tokens(build_prompt(warm_spec))
+    measured_per_target = cfg.reps * sum(cfg.concurrency) * len(cfg.prompts)
+    in_tokens = cfg.warmup * warm_in
+    out_tokens = cfg.warmup * warm_out
+    seconds = cfg.warmup * (PLAN_TTFT_S + warm_out / PLAN_TOK_S)
+    for spec in cfg.prompts.values():
+        cap = int(spec.get("max_tokens", 256))
+        requests = cfg.reps * sum(cfg.concurrency)
+        in_tokens += requests * estimate_tokens(build_prompt(spec))
+        out_tokens += requests * cap
+        # batches run one after another; a concurrent batch lasts ~one request
+        seconds += cfg.reps * len(cfg.concurrency) * (PLAN_TTFT_S + cap / PLAN_TOK_S)
+
+    targets = []
+    for target in cfg.targets:
+        priced = target.price_in is not None and target.price_out is not None
+        cost = (
+            (in_tokens * target.price_in + out_tokens * target.price_out) / 1e6 if priced else None
+        )
+        targets.append(
+            {
+                "target": target.name,
+                "requests": measured_per_target + cfg.warmup,
+                "cost_max_usd": 0.0 if mock else cost,
+            }
+        )
+    costs = [t["cost_max_usd"] for t in targets if t["cost_max_usd"] is not None]
+    return {
+        "requests": planned_requests(cfg),
+        "measured_requests": measured_per_target * len(cfg.targets),
+        "warmup_requests": cfg.warmup * len(cfg.targets),
+        "in_tokens_est": in_tokens * len(cfg.targets),
+        "out_tokens_max": out_tokens * len(cfg.targets),
+        "cost_max_usd": sum(costs) if costs else None,
+        "unpriced": [t["target"] for t in targets if t["cost_max_usd"] is None],
+        "est_minutes": round(seconds * len(cfg.targets) / 60, 1),
+        "assumed": {"tok_s": PLAN_TOK_S, "ttft_s": PLAN_TTFT_S},
+        "targets": targets,
+    }
 
 
 def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
@@ -735,6 +821,10 @@ def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
         "concurrency": cfg.concurrency,
         "warmup": cfg.warmup,
         "temperature": cfg.temperature,
+        "max_tokens": {
+            name: int(spec.get("max_tokens", 256)) for name, spec in cfg.prompts.items()
+        },
+        "timeout_s": cfg.timeout_s,
         "targets": [
             {
                 "name": t.name,
@@ -749,7 +839,8 @@ def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
         "prompts": list(cfg.prompts),
         "baseline": cfg.baseline,
         "http2": HTTP2,
-        "planned_requests": planned_requests(cfg),
+        "planned_requests": planned_requests(cfg),  # includes the warm-ups
+        "planned_warmup": len(cfg.targets) * cfg.warmup,
     }
 
 
@@ -783,6 +874,7 @@ async def execute(
             def record(batch_samples: list[Sample], **info: Any) -> None:
                 nonlocal done
                 for sample in batch_samples:
+                    sample.phase = info["phase"]
                     raw.write(json.dumps(sample.as_dict()) + "\n")
                 raw.flush()
                 samples.extend(batch_samples)
@@ -809,7 +901,7 @@ async def execute(
                             target,
                             warm_text,
                             warm_name,
-                            int(warm_spec.get("max_tokens", 64)),
+                            min(int(warm_spec.get("max_tokens", 256)), WARMUP_MAX_TOKENS),
                             cfg,
                             1,
                             -1,
@@ -886,6 +978,11 @@ def error_class(sample: dict[str, Any]) -> str:
     return (sample.get("error") or "unknown").split(":")[0]
 
 
+def is_warmup(sample: dict[str, Any]) -> bool:
+    # runs recorded before `phase` existed mark warm-ups with batch -1 only
+    return sample.get("phase") == "warmup" or sample.get("batch") == -1
+
+
 def _bucket() -> dict[str, Any]:
     return {
         "ttft": [],
@@ -898,6 +995,8 @@ def _bucket() -> dict[str, Any]:
         "batches": [],
         "ok": 0,
         "n": 0,
+        "truncated": 0,
+        "reasoning_only": 0,
         "errors": {},
         "served": set(),
         "count_source": set(),
@@ -930,7 +1029,7 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
     batch_wall: dict[tuple, float] = {}
 
     for s in samples:
-        if s.get("batch") == -1:  # warm-up
+        if is_warmup(s):
             continue
         key = (s["prompt"], s["target"], s["concurrency"])
         bucket = buckets.setdefault(key, _bucket())
@@ -944,6 +1043,9 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
             total["ok"] += 1
             bucket["served"].add(s.get("served_by"))
             bucket["count_source"].add(s.get("count_source"))
+            bucket["truncated"] += s.get("finish_reason") == "length"
+            # every chunk was reasoning: there is no answer to time
+            bucket["reasoning_only"] += s.get("first_content_s") is None
             for name, source in _FIELDS:
                 bucket[name].append(s.get(source))
             batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s.get("out_tokens") or 0)
@@ -980,10 +1082,37 @@ def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         "aggregate_tps": median(bucket["batches"]),
         "ok": bucket["ok"],
         "n": bucket["n"],
+        "truncated": bucket["truncated"],
+        "reasoning_only": bucket["reasoning_only"],
         "errors": dict(bucket["errors"]),
         "count_source": sorted(x for x in bucket["count_source"] if x),
         "served_by": sorted(x for x in bucket["served"] if x),
     }
+
+
+def reasoning_note(st: dict[str, Any]) -> str | None:
+    """Why first-answer and ITL are empty: the model never got to an answer.
+
+    Its TTFT and tok/s are still real, but they time the thinking — say so
+    instead of printing a bare "—" that looks like a broken tool.
+    """
+    ok, only = st["ok"], st["reasoning_only"]
+    if not only:
+        return None
+    if only < ok:
+        return (
+            f"{only}/{ok} responses were reasoning only (no answer text); "
+            "first answer and ITL cover the rest"
+        )
+    if st["truncated"] == ok:
+        return (
+            f"hit the token cap while reasoning ({ok}/{ok} finish_reason=length, no answer "
+            "text) — TTFT and tok/s measured thinking, not answering; raise --max-tokens"
+        )
+    return (
+        f"no answer text in {ok}/{ok} responses (reasoning only) — TTFT and tok/s "
+        "measured thinking, not answering"
+    )
 
 
 def request_cost(
@@ -1053,9 +1182,11 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
             "",
         ]
     model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
+    caps = sorted(set((meta.get("max_tokens") or {}).values()))
+    cap = f" · max_tokens {'/'.join(map(str, caps))}" if caps else ""
     lines.append(
         f"- model: `{model}` · reps {meta.get('reps')} · "
-        f"concurrency {meta.get('concurrency')} · temp {meta.get('temperature')} · "
+        f"concurrency {meta.get('concurrency')} · temp {meta.get('temperature')}{cap} · "
         f"http2 {meta.get('http2')}"
     )
     version = f" · tps {meta['tps_version']}" if meta.get("tps_version") else ""
@@ -1139,6 +1270,12 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                     ]
             lines.append("| " + " | ".join(str(c) for c in cells) + " |")
         lines.append("")
+        notes = [(t, reasoning_note(bucket_stats(b))) for t, b in rows]
+        for target, note in notes:
+            if note:
+                lines.append(f"> ⚠ **{target}**: {note}.")
+        if any(note for _t, note in notes):
+            lines.append("")
 
         peak = max((p50(b["tps"]) or 0 for _t, b in rows), default=0.0)
         lines.append("```")
@@ -1236,7 +1373,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
     totals: dict[str, int] = {}
     errors: dict[str, dict[str, int]] = {}
     for s in samples:
-        if s.get("batch", 0) == -1:
+        if is_warmup(s):
             continue
         name = s["target"]
         totals[name] = totals.get(name, 0) + 1
@@ -1285,6 +1422,8 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                 "first_content_p50_s",
                 "count_source",
                 "served_by",
+                "truncated",
+                "reasoning_only",
             ]
         )
         for (prompt, target, conc), bucket in sorted(buckets.items()):
@@ -1308,6 +1447,8 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                     fmt(st["first_content_p50_s"], 3),
                     ";".join(st["count_source"]),
                     ";".join(st["served_by"]),
+                    st["truncated"],
+                    st["reasoning_only"],
                 ]
             )
 
@@ -1481,6 +1622,43 @@ def targets_toml(canonical: str, endpoints: list[dict[str, Any]]) -> tuple[str, 
             blocks.append("price = " + _toml_inline(price))
         blocks.append("")
     return "\n".join(blocks), len(groups), collapsed
+
+
+def endpoint_toml(
+    base_url: str,
+    model: str,
+    name: str | None = None,
+    api_key_env: str | None = None,
+    price: tuple[float, float] | None = None,
+    source: str = "tps init --endpoint",
+) -> str:
+    """A one-target config for any OpenAI-compatible endpoint, no gateway needed.
+
+    `tps init --endpoint` writes it; `tps run --base-url` builds it in memory
+    and saves a copy in the run directory so the run can be repeated.
+    """
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise UsageError(f"not an http(s) URL: {base_url!r} — e.g. https://api.example.com/v1")
+    lines = [
+        f"# generated by: {source} {base_url} --model {model}",
+        "# add more [[targets]] blocks to compare providers side by side",
+        "",
+        "[run]",
+        "reps = 7",
+        "concurrency = [1]",
+        'prompts = ["prose-256"]',
+        "",
+        "[[targets]]",
+        f"name = {_toml_inline(name or parsed.netloc)}",
+        f"base_url = {_toml_inline(base_url)}",
+        f"model = {_toml_inline(model)}",
+    ]
+    if api_key_env:
+        lines.append(f"api_key_env = {_toml_inline(api_key_env)}")
+    if price:
+        lines.append("price = " + _toml_inline({"in_per_1m": price[0], "out_per_1m": price[1]}))
+    return "\n".join(lines) + "\n"
 
 
 def discover(

@@ -28,18 +28,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import httpx  # noqa: E402
+try:
+    import httpx  # noqa: E402
 
-from tps import core  # noqa: E402
+    from tps import core  # noqa: E402
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        f"selftest: `{exc.name}` is not installed — set up the dev environment first "
+        "(CONTRIBUTING.md):\n\n"
+        '    python -m venv .venv && . .venv/bin/activate && pip install -e ".[http2,dev]"\n'
+    ) from None
 
 TOKENS = 32
 FIRST_DELAY = 0.05
 TOKEN_DELAY = 0.01
 BIG_CHUNK = 32  # tokens per chunk for the "big-chunks" model
 BIG_DELAY = 0.02
+THINK = 300  # the "thinker" model reasons this long before it answers
 
 INFLIGHT = {"n": 0}
 INFLIGHT_LOCK = threading.Lock()
+SEEN: list[tuple[str, int | None]] = []  # (model, max_tokens) of every request
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,6 +79,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         model = body.get("model", "")
+        SEEN.append((model, body.get("max_tokens")))
 
         if model == "echo-key":  # some providers echo the submitted key in errors
             # header key near the start; the bearer key straddles the 600-char cut
@@ -115,6 +125,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._emit(
                         {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 15}}
                     )
+            self._done()
+            return
+        if model == "thinker":
+            # below a THINK-token cap it never gets to the answer, like a
+            # reasoning model at max_tokens 256
+            cap = int(body.get("max_tokens") or 0)
+            answers = cap > THINK
+            time.sleep(FIRST_DELAY)
+            for i in range(6):
+                self._emit({"choices": [{"delta": {"reasoning": f"step {i} "}}]})
+                time.sleep(TOKEN_DELAY)
+            for i in range(6 if answers else 0):
+                self._emit({"choices": [{"delta": {"content": f"answer{i} "}}]})
+                time.sleep(TOKEN_DELAY)
+            reason = "stop" if answers else "length"
+            self._emit({"choices": [{"delta": {}, "finish_reason": reason}]})
+            usage = {
+                "prompt_tokens": 11,
+                "completion_tokens": THINK + 6 if answers else cap,
+                "completion_tokens_details": {"reasoning_tokens": min(THINK, cap)},
+            }
+            if want_usage:
+                self._emit({"choices": [], "usage": usage})
             self._done()
             return
         if model == "midstream-error":
@@ -289,10 +322,15 @@ async def main() -> int:
                 sample.ttft_s is not None and sample.ttft_s >= FIRST_DELAY * 0.9,
                 f"ttft={sample.ttft_s}",
             )
+            # Streamed, not buffered: the first token lands while the server
+            # still has (TOKENS - 1) × TOKEN_DELAY of sleeping to do. Measured
+            # against the same request's end, not a wall-clock budget, so a cold
+            # first connection shifts both numbers and can't fail it.
             check(
-                "ttft < 3x delay (no buffering)",
-                sample.ttft_s < FIRST_DELAY * 3,
-                f"ttft={sample.ttft_s}",
+                "first token arrives long before the stream ends (no buffering)",
+                sample.ttft_s is not None
+                and sample.e2e_s - sample.ttft_s >= 0.5 * (TOKENS - 1) * TOKEN_DELAY,
+                f"ttft={sample.ttft_s} e2e={sample.e2e_s}",
             )
             check("token count from usage", sample.out_tokens == TOKENS, str(sample.out_tokens))
             check("prompt tokens from usage", sample.in_tokens == 11, str(sample.in_tokens))
@@ -394,6 +432,37 @@ async def main() -> int:
                 and thinking.count_source == "chars/4",
                 f"{thinking.out_tokens} {thinking.count_source}",
             )
+            capped = await once(tgt("thinker"))
+            check(
+                "token cap while reasoning: finish_reason and reasoning tokens recorded",
+                capped.ok
+                and capped.finish_reason == "length"
+                and capped.reasoning_tokens == 64
+                and capped.first_content_s is None
+                and capped.itl_p50_ms is None,
+                f"{capped.finish_reason} {capped.reasoning_tokens} {capped.first_content_s}",
+            )
+
+            def note_for(*samples: core.Sample) -> str:
+                stats = core.summarize([s.as_dict() for s in samples])
+                return (
+                    core.reasoning_note(
+                        core.bucket_stats(stats["buckets"][next(iter(stats["buckets"]))])
+                    )
+                    or ""
+                )
+
+            check(
+                "all-reasoning row says it measured thinking, not answering",
+                "measured thinking" in note_for(capped) and "--max-tokens" in note_for(capped),
+                note_for(capped),
+            )
+            check(
+                "mixed row counts the reasoning-only responses",
+                note_for(capped, reasoning).startswith("1/2 responses were reasoning only"),
+                note_for(capped, reasoning),
+            )
+            check("answered row has no note", note_for(reasoning) == "", note_for(reasoning))
 
         print("report pipeline:")
         run_dir = Path(tempfile.mkdtemp(prefix="tps-selftest-"))
@@ -691,6 +760,203 @@ async def main() -> int:
         )
         zero = tps(["run", "-c", "local.toml", "--concurrency", "0"], work)
         check("--concurrency 0 rejected", zero.returncode == 1, zero.stderr[-200:])
+        for flag, value in (("--max-tokens", "0"), ("--temperature", "-1"), ("--timeout", "0")):
+            bad = tps(["run", "-c", "local.toml", flag, value], work)
+            check(f"{flag} {value} rejected", bad.returncode == 1, bad.stderr[-200:])
+
+        (work / "warm.toml").write_text(
+            '[run]\nreps = 1\nwarmup = 2\nprompts = ["prose-256"]\n\n'
+            + target_block("warm", base, "warm-model"),
+            encoding="utf-8",
+        )
+        warm_payload = json.loads(
+            tps(["run", "-c", "warm.toml", "-o", "warm", "--json"], work).stdout or "{}"
+        )
+        warm_caps = [cap for model, cap in SEEN if model == "warm-model"]
+        check(
+            "warm-ups are capped; measured requests keep the prompt's max_tokens",
+            warm_caps == [core.WARMUP_MAX_TOKENS] * 2 + [256],
+            str(warm_caps),
+        )
+        warm_raw = (work / "warm" / "raw.jsonl").read_text(encoding="utf-8").splitlines()
+        check(
+            "raw rows say which phase they belong to",
+            [json.loads(line).get("phase") for line in warm_raw] == ["warmup", "warmup", "measure"],
+            str([json.loads(line).get("phase") for line in warm_raw]),
+        )
+        check(
+            "run JSON labels every request count",
+            warm_payload.get("total") == 1
+            and warm_payload.get("warmup_requests") == 2
+            and warm_payload.get("planned_requests") == 3
+            and warm_payload.get("results", [{}])[0].get("n") == 1,
+            str({k: warm_payload.get(k) for k in ("total", "warmup_requests", "planned_requests")}),
+        )
+
+        one_shot = tps(
+            [
+                "run",
+                "--base-url",
+                base,
+                "--model",
+                "test-model",
+                "--name",
+                "direct",
+                "--price",
+                "0.1,0.2",
+                "--reps",
+                "2",
+                "-o",
+                "oneshot",
+                "--json",
+            ],
+            work,
+        )
+        one_payload = json.loads(one_shot.stdout or "{}")
+        saved = work / "oneshot" / "targets.toml"
+        one_row = (one_payload.get("results") or [{}])[0]
+        check(
+            "run --base-url: no config file, results as usual",
+            one_shot.returncode == 0
+            and one_row.get("target") == "direct"
+            and one_row.get("ok") == 2
+            and one_row.get("price_out_per_1m") == 0.2,
+            one_shot.stderr[-300:] or str(one_row)[:200],
+        )
+        check(
+            "run --base-url saves its config in the run dir, and it reloads",
+            one_payload.get("config") == str(Path("oneshot") / "targets.toml")
+            and saved.exists()
+            and core.load_config(saved).targets[0].base_url == base,
+            str(one_payload.get("config")),
+        )
+        (work / "init-ep.toml").unlink(missing_ok=True)
+        init_ep = tps(
+            [
+                "init",
+                "--endpoint",
+                "https://api.example.invalid/v1",
+                "--model",
+                'vendor/model "x"',
+                "--api-key-env",
+                "TPS_SELFTEST_UNSET_KEY",
+                "--out",
+                "init-ep.toml",
+            ],
+            work,
+        )
+        init_target = (
+            core.load_config(work / "init-ep.toml").targets[0]
+            if (work / "init-ep.toml").exists()
+            else None
+        )
+        check(
+            "init --endpoint writes a loadable one-target config",
+            init_ep.returncode == 0
+            and init_target is not None
+            and init_target.model == 'vendor/model "x"'
+            and init_target.api_key_env == "TPS_SELFTEST_UNSET_KEY",
+            init_ep.stderr[-200:],
+        )
+        for argv, why in (
+            (["run", "--model", "m"], "--model without --base-url"),
+            (["run", "--base-url", base], "--base-url without --model"),
+            (["run", "--base-url", "ftp://x", "--model", "m"], "a non-http URL"),
+            (["run", "-c", "local.toml", "--base-url", base, "--model", "m"], "-c and --base-url"),
+            (["run", "--base-url", base, "--model", "m", "--price", "1"], "a one-number --price"),
+            (["init", "--price", "1,2", "--out", "never.toml"], "init --price without --endpoint"),
+        ):
+            rejected = tps(argv, work)
+            check(f"rejected: {why}", rejected.returncode == 1, rejected.stderr[-200:])
+        unkeyed = tps(["run", "--base-url", "https://api.example.invalid/v1", "--model", "m"], work)
+        check(
+            "remote --base-url without a key exits 2 and says how to pass one",
+            unkeyed.returncode == 2 and "--api-key-env" in unkeyed.stderr,
+            unkeyed.stderr[-200:],
+        )
+
+        print("dry run:")
+        (work / "plan.toml").write_text(
+            '[run]\nreps = 3\nconcurrency = [1, 4]\nwarmup = 1\nprompts = ["prose-256"]\n\n'
+            + target_block(
+                "priced",
+                "https://api.example.invalid/v1",
+                "m",
+                'api_key_env = "TPS_SELFTEST_UNSET_KEY"\nprice = { in_per_1m = 1.0, out_per_1m = 2.0 }',
+            )
+            + target_block("free-local", base, "test-model"),
+            encoding="utf-8",
+        )
+        before = len(SEEN)
+        plan_run = tps(["run", "-c", "plan.toml", "-o", "planned", "--dry-run", "--json"], work)
+        plan_payload = json.loads(plan_run.stdout or "{}")
+        plan = plan_payload.get("plan", {})
+        prompt_in = core.estimate_tokens(core.build_prompt(core.DEFAULT_PROMPTS["prose-256"]))
+        # priced target: 15 measured × (in + 256 out) + 1 warm-up × (in + 16 out)
+        expected = (16 * prompt_in * 1.0 + (15 * 256 + core.WARMUP_MAX_TOKENS) * 2.0) / 1e6
+        check(
+            "dry run: sends nothing, writes nothing, exits 0 despite a missing key",
+            plan_run.returncode == 0
+            and len(SEEN) == before
+            and not (work / "planned").exists()
+            and plan_payload.get("dry_run") is True
+            and plan_payload.get("missing_credentials") == ["priced"],
+            f"{plan_run.returncode} {len(SEEN) - before} {plan_run.stderr[-200:]}",
+        )
+        check(
+            "dry run: counts requests exactly as the run would",
+            plan.get("requests") == 2 * (3 * 5 + 1)
+            and plan.get("measured_requests") == 30
+            and plan.get("warmup_requests") == 2,
+            str({k: plan.get(k) for k in ("requests", "measured_requests", "warmup_requests")}),
+        )
+        check(
+            "dry run: worst-case cost from max_tokens, unpriced targets listed, not guessed",
+            plan.get("cost_max_usd") is not None
+            and abs(plan["cost_max_usd"] - expected) < 1e-9
+            and plan.get("unpriced") == ["free-local"],
+            f"{plan.get('cost_max_usd')} vs {expected} {plan.get('unpriced')}",
+        )
+        check(
+            "dry run: the time estimate states its assumption",
+            plan.get("est_minutes", 0) > 0 and plan.get("assumed", {}).get("tok_s") > 0,
+            str(plan.get("assumed")),
+        )
+
+        (work / "think.toml").write_text(
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("thinker", base, "thinker"),
+            encoding="utf-8",
+        )
+        capped_run = tps(["run", "-c", "think.toml", "-o", "think", "--json"], work)
+        capped_row = (json.loads(capped_run.stdout or "{}").get("results") or [{}])[0]
+        check(
+            "capped reasoning row explains its empty columns",
+            capped_row.get("reasoning_only") == 2
+            and capped_row.get("truncated") == 2
+            and capped_row.get("itl_p50_ms") is None
+            and "measured thinking" in " ".join(capped_row.get("notes", [])),
+            str({k: capped_row.get(k) for k in ("reasoning_only", "truncated", "notes")}),
+        )
+        check(
+            "report.md and the terminal say so too",
+            "measured thinking" in (work / "think" / "report.md").read_text(encoding="utf-8")
+            and "measured thinking" in tps(["report", "think"], work).stdout,
+        )
+        raised_run = tps(
+            ["run", "-c", "think.toml", "-o", "think-raised", "--max-tokens", "400", "--json"],
+            work,
+        )
+        raised_row = (json.loads(raised_run.stdout or "{}").get("results") or [{}])[0]
+        raised_meta = json.loads((work / "think-raised" / "meta.json").read_text())
+        check(
+            "--max-tokens reaches the request (the thinker answers above its cap)",
+            raised_row.get("reasoning_only") == 0
+            and raised_row.get("first_content_p50_s") is not None
+            and raised_row.get("notes") == []
+            and raised_meta.get("max_tokens") == {"prose-256": 400},
+            f"{raised_row.get('reasoning_only')} {raised_meta.get('max_tokens')}",
+        )
 
         (work / "dup.toml").write_text(
             target_block("same", base, "test-model") + target_block("same", base, "other-model"),
