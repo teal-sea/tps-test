@@ -11,15 +11,27 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      # installing the package also exercises packaging: console script, deps
       - name: Install
-        run: pip install "httpx[http2]"
+        run: pip install ".[http2]"
+
       # selftest.py spins up a local SSE server and reads a recorded fixture:
       # no network egress, no API keys, so it runs fine on a public runner.
-      - name: Run selftest
+      - name: Self-test
         run: python tests/selftest.py
+
+      - name: CLI smoke test
+        run: |
+          tps --version
+          tps doctor --no-color || test $? -eq 2   # no keys in CI: 2 is expected
+          tps run -c targets.mock.toml --mock --reps 2 --json > run.json
+          jq -e '.ok == true and (.results | length) == 3' run.json
+          tps fingerprint -c targets.mock.toml --mock --reps 2 --prompt-count 1 --json > fp.json
+          jq -e '.schema_version == 1 and (.clusters | length) >= 1' fp.json

@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 import httpx  # noqa: E402
 
-import rig  # noqa: E402
+from tps import core as rig  # noqa: E402
 
 TOKENS = 32
 FIRST_DELAY = 0.05

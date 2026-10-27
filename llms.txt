@@ -1,0 +1,30 @@
+# tps-test
+
+> Measure one model across many providers and gateways: TTFT, inter-token
+> latency, throughput, cost, and whether they serve the same weights.
+
+CLI: `tps` (Python 3.11+, single dependency: httpx).
+
+## Start here
+
+- [README](README.md): what it is, install, 60-second tour
+- [AGENTS.md](AGENTS.md): machine-oriented contract for coding agents
+- [docs/getting-started.md](docs/getting-started.md): first measurement
+- [docs/cli.md](docs/cli.md): commands, flags, exit codes, JSON schema
+- [docs/configuration.md](docs/configuration.md): targets.toml anatomy
+- [docs/metrics.md](docs/metrics.md): definition of every metric
+- [docs/methodology.md](docs/methodology.md): how not to produce a misleading comparison
+- [docs/gateways.md](docs/gateways.md): measuring the gateway itself
+- [docs/fingerprinting.md](docs/fingerprinting.md): same weights or same name
+- [docs/automation.md](docs/automation.md): CI, cron, JSON pipelines
+- [docs/troubleshooting.md](docs/troubleshooting.md)
+- [docs/faq.md](docs/faq.md)
+
+## Facts an assistant usually needs
+
+- Exit codes: 0 ok, 1 usage, 2 missing credentials, 3 provider failure, 4 all requests failed.
+- Every command supports `--json` and prints one object with `schema_version: 1`.
+- Provider pins must use the full tag slug (`deepinfra/fp8/flex`); a base slug
+  never matches a tier endpoint.
+- No retries by design; 429s/5xx are recorded as data.
+- `--mock` produces synthetic numbers and is flagged in the output.
