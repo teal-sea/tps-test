@@ -1,0 +1,80 @@
+# Gateway comparison — a gateway is just a base_url.
+#
+# Three different questions, three different row pairs:
+#
+#   1. WHAT DOES THE HOP COST?      same upstream, direct vs through the gateway
+#      Answer: (or-throughput) - (together-direct)
+#      Requires the vendor to be reachable BOTH ways. If it isn't, you are
+#      measuring hop overhead + a different upstream + different routing, and
+#      no amount of careful reading will separate them.
+#
+#   2. WHAT DOES THE ROUTER'S CHOICE COST ME?   unpinned vs your best pin
+#      Answer: (or-unpinned-price) - (or-pinned-together)
+#
+#   3. IS THE GATEWAY ITSELF THE BOTTLENECK?    one gateway vs another
+#      Add a second gateway block below, same model, same pins.
+#
+# Run with the baseline set (see [run]) to get Δ columns instead of eyeballing:
+#   .venv/bin/python rig.py run -c targets.gateway.toml
+
+[run]
+reps = 7
+concurrency = [1, 4]
+warmup = 2
+temperature = 0.0
+timeout_s = 180
+prompts = ["prose-256"]
+# set this to the direct row once you know the vendor's model id; until then
+# the deltas are versus the pinned gateway row, which is still useful
+baseline = "or-pinned-together"
+
+# --- 1. gateway, pinned to one upstream ------------------------------------
+
+[[targets]]
+name = "or-pinned-together"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { only = ["together"], allow_fallbacks = false }
+price = { in_per_1m = 0.300, out_per_1m = 1.200 }
+
+# --- 2. the router choosing for you ---------------------------------------
+
+[[targets]]
+name = "or-unpinned-price"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+# no provider block = default price-weighted load balancing
+
+[[targets]]
+name = "or-unpinned-throughput"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+extra_body.provider = { sort = "throughput" }
+
+# --- 1b. the direct baseline ----------------------------------------------
+# Fireworks runs DeepSeek weights and is also an OpenRouter provider for this
+# model, which makes it the cleanest same-upstream pair. Confirm the exact
+# model id in your Fireworks account — assertions here are config, not truth.
+
+# [[targets]]
+# name = "fireworks-direct"
+# base_url = "https://api.fireworks.ai/inference/v1"
+# model = "accounts/fireworks/models/deepseek-v4.1-flash"
+# api_key_env = "FIREWORKS_API_KEY"
+# price = { in_per_1m = 0.210, out_per_1m = 0.840 }
+
+# --- 3. a second gateway, for hop comparison -------------------------------
+# Anything OpenAI-compatible works: LiteLLM proxy, Portkey, Helicone, your own
+# nginx in front of a vendor. Point base_url at it and pin the same upstream
+# where the gateway supports it; otherwise note that the pin is not preserved
+# and the row measures routing too.
+
+# [[targets]]
+# name = "litellm-proxy"
+# base_url = "http://localhost:4000/v1"
+# model = "deepseek/deepseek-v4.1-flash"
+# api_key_env = "LITELLM_MASTER_KEY"
+# extra_body.provider = { only = ["together"], allow_fallbacks = false }

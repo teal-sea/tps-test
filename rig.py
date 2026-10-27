@@ -173,6 +173,7 @@ class RunConfig:
     temperature: float = 0.0
     max_tokens_field: str = "max_tokens"
     stream_options: bool = True
+    baseline: str | None = None
 
 
 def load_config(path: Path) -> RunConfig:
@@ -233,6 +234,7 @@ def load_config(path: Path) -> RunConfig:
         temperature=float(run.get("temperature", 0.0)),
         max_tokens_field=run.get("max_tokens_field", "max_tokens"),
         stream_options=bool(run.get("stream_options", True)),
+        baseline=run.get("baseline"),
     )
 
 
@@ -608,6 +610,7 @@ async def execute(cfg: RunConfig, outdir: Path, mock: bool) -> list[Sample]:
             for t in cfg.targets
         ],
         "prompts": list(cfg.prompts),
+        "baseline": cfg.baseline,
         "http2": HTTP2,
     }
     (outdir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -763,32 +766,60 @@ def write_report(
     for prompt in prompts:
         lines.append(f"## `{prompt}` — single stream")
         lines.append("")
-        lines.append(
-            "| provider | TTFT p50 | TTFT p90 | out tok/s p50 | out tok/s p90 | "
-            "ITL p50 ms | E2E p50 | out tok | ok |"
-        )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
         rows = []
         for target in targets:
             slot = per_stream.get((prompt, target))
             if not slot:
                 continue
             rows.append((target, slot))
+
+        # optional delta columns against a named baseline (usually the
+        # no-gateway direct endpoint): this is what turns "which is faster"
+        # into "what did the gateway hop cost me"
+        base_name = meta.get("baseline")
+        base_slot = per_stream.get((prompt, base_name)) if base_name else None
+        base_ttft = percentile(base_slot["ttft"], 0.5) if base_slot else None
+        base_tps = percentile(base_slot["tps"], 0.5) if base_slot else None
+        show_delta = bool(base_slot and base_ttft and base_tps)
+
+        header = [
+            "provider", "TTFT p50", "TTFT p90", "out tok/s p50", "out tok/s p90",
+            "ITL p50 ms", "E2E p50", "out tok", "ok",
+        ]
+        if show_delta:
+            header += [f"Δ TTFT vs {base_name}", f"Δ tok/s vs {base_name}"]
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("|" + "---|" * len(header))
+
         for target, slot in rows:
-            lines.append(
-                "| {t} | {a} | {b} | {c} | {d} | {e} | {f} | {g} | {h}/{i} |".format(
-                    t=target,
-                    a=fmt(percentile(slot["ttft"], 0.5), 2),
-                    b=fmt(percentile(slot["ttft"], 0.9), 2),
-                    c=fmt(percentile(slot["tps"], 0.5)),
-                    d=fmt(percentile(slot["tps"], 0.9)),
-                    e=fmt(percentile(slot["itl"], 0.5)),
-                    f=fmt(percentile(slot["e2e"], 0.5), 2),
-                    g=fmt(statistics.median(slot["out"]) if slot["out"] else None, 0),
-                    h=slot["ok"],
-                    i=slot["n"],
-                )
-            )
+            ttft_p50 = percentile(slot["ttft"], 0.5)
+            tps_p50 = percentile(slot["tps"], 0.5)
+            cells = [
+                target,
+                fmt(ttft_p50, 2),
+                fmt(percentile(slot["ttft"], 0.9), 2),
+                fmt(tps_p50),
+                fmt(percentile(slot["tps"], 0.9)),
+                fmt(percentile(slot["itl"], 0.5)),
+                fmt(percentile(slot["e2e"], 0.5), 2),
+                fmt(statistics.median(slot["out"]) if slot["out"] else None, 0),
+                f"{slot['ok']}/{slot['n']}",
+            ]
+            if show_delta:
+                if target == base_name:
+                    cells += ["—", "—"]
+                else:
+                    d_ttft = (ttft_p50 - base_ttft) if ttft_p50 is not None else None
+                    d_tps = (
+                        (tps_p50 - base_tps) / base_tps * 100
+                        if tps_p50 is not None
+                        else None
+                    )
+                    cells += [
+                        "—" if d_ttft is None else f"{d_ttft:+.2f}",
+                        "—" if d_tps is None else f"{d_tps:+.0f}%",
+                    ]
+            lines.append("| " + " | ".join(str(c) for c in cells) + " |")
         lines.append("")
 
         peak = max(

@@ -4,6 +4,7 @@
 
 [run]
 reps = 6
+baseline = "mid-provider"
 concurrency = [1, 4]
 warmup = 0
 prompts = ["prose-256"]
