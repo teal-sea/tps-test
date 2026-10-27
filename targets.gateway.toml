@@ -21,7 +21,7 @@
 reps = 7
 concurrency = [1, 4]
 warmup = 2
-temperature = 0.0
+# temperature = 0.0    # the default; never sent to api = "anthropic" targets
 timeout_s = 180
 prompts = ["prose-256"]
 # set this to the direct row once you know the vendor's model id; until then

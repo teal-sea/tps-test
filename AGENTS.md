@@ -45,7 +45,9 @@ tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--time
 ```
 
 `--base-url` measures one OpenAI-compatible endpoint with no config file (not
-with `-c`); the generated config is saved as `<run_dir>/targets.toml`.
+with `-c`); the generated config is saved as `<run_dir>/targets.toml` with the
+effective settings (overrides included), and never replaces a different
+`targets.toml` already there (exit 1).
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
 Messages API — the only Anthropic endpoint that accepts subscription/OAuth
 tokens; it sends no `temperature` (Claude 4.7+ 400s on it) and keeps hidden
@@ -115,9 +117,16 @@ model that hit `max_tokens` while thinking (`truncated` counts
 `finish_reason: "length"`, which the built-in prompts reach by design). Then
 `first_content_p50_s`/`itl_p50_ms` are null and TTFT/tok/s time the *thinking*;
 `notes` says so. Re-run with a larger `--max-tokens`; don't report those rates as
-answer speed.
+answer speed. Like `ok`/`n`, `truncated` and `reasoning_only` count every
+concurrency level; `by_concurrency` has them per level. `count_source`
+`usage+chars/4` means part of the reasoning was hidden and estimated.
 
-`bursty` > 0 means chunks arrived in clumps (median gap < 20% of the mean), so
+Error classes beyond HTTP/transport: `stream_error`, `incomplete_stream` (Claude
+stream with no `message_stop`), `content_filter`, `refusal`, `no_content`,
+`empty_stream` — none is timed as an answer.
+
+`bursty` > 0 means chunks arrived in clumps (median gap < 20% of the typical
+gap — the mean without its longest 2%), so
 `itl_p50_ms` measures a proxy's flushing, not the model — don't rank providers
 on it. `itl_n` / `first_content_n` give the sample count behind those medians;
 `tokens_per_chunk_median` reconciles ITL with tok/s.
@@ -135,7 +144,10 @@ the stated rate.
 `fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
 `no_data{target: error}`, `noisy[]`, `unmeasured[]`, `distinguishable_groups`,
 `noise_floor_measured`, `self_agreement{}`,
-`pairs[]`, `prompt_tokens{}`.
+`pairs[]`, `prompt_tokens{}`, `reasoning_seen[]`. It requests 20
+`top_logprobs` (5 if capped; all kept in `fingerprints.jsonl`) and turns
+reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
+`no_data` with `reasoning_consumed_budget`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`.
 
 Treat `results[].ok/n` as the reliability signal — they count every concurrency

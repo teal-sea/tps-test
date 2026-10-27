@@ -51,6 +51,8 @@ INFLIGHT = {"n": 0}
 INFLIGHT_LOCK = threading.Lock()
 SEEN: list[tuple[str, int | None, bool]] = []  # (model, max_tokens, sent temperature?)
 AUTH: list[str] = []  # how each Claude API request authenticated
+BODIES: dict[str, dict] = {}  # the last request body per model
+BETA: dict[str, str | None] = {}  # the last anthropic-beta header per model
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -82,6 +84,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         model = body.get("model", "")
         SEEN.append((model, body.get("max_tokens"), "temperature" in body))
+        BODIES[model] = body
+        BETA[model] = self.headers.get("anthropic-beta")
         if self.path.rstrip("/").endswith("/messages"):
             self._claude(body)
             return
@@ -185,6 +189,14 @@ class Handler(BaseHTTPRequestHandler):
             self._done()
             return
 
+        if model in ("filtered", "silent-stop"):
+            # billed and finished, but nothing streamed: a filter, or an empty reply
+            reason = "content_filter" if model == "filtered" else "stop"
+            self._emit({"choices": [{"delta": {}, "finish_reason": reason}]})
+            self._emit({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 5}})
+            self._done()
+            return
+
         delay = 0.05 if model == "slow" else TOKEN_DELAY
         time.sleep(FIRST_DELAY)
         # role-only chunk: must NOT count as the first token
@@ -237,6 +249,8 @@ class Handler(BaseHTTPRequestHandler):
             "output_tokens_details": {"thinking_tokens": HIDDEN if answers else cap},
         }
         stop = "end_turn" if answers else "max_tokens"
+        if model == "claude-refusal":
+            stop = "refusal"
         text = " ".join(f"tok{i}" for i in range(TOKENS))
         if not body.get("stream"):
             content = [{"type": "thinking", "thinking": ""}]
@@ -257,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(TOKEN_DELAY)
             delta = {"type": "text_delta", "text": f"tok{i} "}
             self._emit({"type": "content_block_delta", "index": 1, "delta": delta})
+        if model == "claude-cut":
+            return  # a proxy closing the stream early: no message_delta, no message_stop
         self._emit({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": usage})
         self._emit({"type": "message_stop"})
 
@@ -289,6 +305,23 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": {"message": "logprobs are not supported for this model", "code": 400}},
             )
             return
+        if model == "capped-logprobs" and (body.get("top_logprobs") or 0) > 5:
+            self._json(400, {"error": {"message": "top_logprobs must be between 0 and 5"}})
+            return
+        if model == "reasoner-empty":  # thought through the whole cap, answered nothing
+            message = {"role": "assistant", "content": "", "reasoning": "let me think" * 20}
+            self._json(
+                200,
+                {
+                    "choices": [{"message": message, "finish_reason": "length"}],
+                    "usage": {
+                        "prompt_tokens": 78,
+                        "completion_tokens": 160,
+                        "completion_tokens_details": {"reasoning_tokens": 160},
+                    },
+                },
+            )
+            return
 
         tokens = [f"t{i}" for i in range(120)]
         if model == "other-model":
@@ -299,8 +332,19 @@ class Handler(BaseHTTPRequestHandler):
             "finish_reason": "length",
         }
         if body.get("logprobs"):
+            k = min(int(body.get("top_logprobs") or 0), 3)
             choice["logprobs"] = {
-                "content": [{"token": t, "logprob": -0.01, "top_logprobs": []} for t in tokens]
+                "content": [
+                    {
+                        "token": t,
+                        "logprob": -0.01,
+                        "top_logprobs": [
+                            {"token": t, "logprob": -0.01},
+                            *({"token": f"alt{j}", "logprob": -5.0 - j} for j in range(k - 1)),
+                        ],
+                    }
+                    for t in tokens
+                ]
             }
         self._json(
             200,
@@ -542,6 +586,13 @@ async def main() -> int:
                 not core.is_bursty(sample.as_dict()),
                 f"p50={sample.itl_p50_ms} mean={sample.itl_mean_ms}",
             )
+            stall = [0.02] * 30 + [5.0]  # steady 20 ms, one 5 s stall (review #10)
+            stalled = {"itl_p50_ms": 20.0, "itl_pace_ms": core.itl_pace(stall) * 1000}
+            check(
+                "one long stall in a steady stream is not called a burst",
+                not core.is_bursty(stalled),
+                str(stalled),
+            )
             check(
                 "tokens per chunk counts what each chunk carried",
                 big.tokens_per_chunk == BIG_CHUNK,
@@ -633,6 +684,40 @@ async def main() -> int:
                 "claude: the row says TTFT includes hidden thinking",
                 any(f"~{HIDDEN} thinking tokens" in n for n in claude_notes),
                 str(claude_notes),
+            )
+
+            print("responses that are not answers (review fixes):")
+            for model, api, cls in (
+                ("filtered", "openai", "content_filter"),
+                ("claude-refusal", "anthropic", "refusal"),
+                ("silent-stop", "openai", "no_content"),
+            ):
+                declined = await once(tgt(model, api=api, api_key=claude_key))
+                check(
+                    f"{model}: not ok, classified {cls} (never 'reasoning only')",
+                    not declined.ok and core.error_class(declined.as_dict()) == cls,
+                    f"{declined.ok} {declined.error}",
+                )
+            cut = await once(tgt("claude-cut", api="anthropic", api_key=claude_key))
+            check(
+                "claude: a stream cut before message_stop fails, keeping no placeholder count",
+                not cut.ok and (cut.error or "").startswith("incomplete_stream"),
+                f"{cut.ok} {cut.error} {cut.out_tokens}",
+            )
+            await once(tgt("claude-sim", api="anthropic", api_key="sk-ant-oat01-subscription"))
+            oauth_beta = BETA.get("claude-sim")
+            await once(tgt("claude-sim", api="anthropic", api_key="sk-ant-si-session"))
+            check(
+                "claude: an OAuth token carries the oauth beta header; other tokens don't",
+                oauth_beta == core.ANTHROPIC_OAUTH_BETA and BETA.get("claude-sim") is None,
+                f"{oauth_beta} / {BETA.get('claude-sim')}",
+            )
+            vllm = {"stream_options": {"include_usage": True, "continuous_usage_stats": True}}
+            await once(tgt("test-model", extra_body=vllm))
+            check(
+                "extra_body still wins over the stream_options tps adds",
+                BODIES["test-model"].get("stream_options") == vllm["stream_options"],
+                str(BODIES["test-model"].get("stream_options")),
             )
 
         print("report pipeline:")
@@ -806,6 +891,86 @@ async def main() -> int:
             "unmeasured target joins the one group it matches",
             joined["verdict"] == "consistent" and joined["clusters"] == [["a", "b", "u"]],
             f"{joined['verdict']} {joined['clusters']}",
+        )
+
+        print("fingerprint v2 groundwork:")
+        omit_cfg = core.RunConfig(targets=[], prompts={}, temperature="omit")
+        async with httpx.AsyncClient(http2=False, timeout=30.0) as fp_client:
+            full = await core.fingerprint_once(
+                fp_client, alpha, "probe", "prose-256", 120, fp_cfg, 0
+            )
+            full_body = dict(BODIES["test-model"])
+            omitted = await core.fingerprint_once(
+                fp_client, tgt("test-model", name="o"), "probe", "prose-256", 120, omit_cfg, 0
+            )
+            omit_body = dict(BODIES["test-model"])
+            capped_lp = await core.fingerprint_once(
+                fp_client, tgt("capped-logprobs", name="c"), "probe", "prose-256", 120, fp_cfg, 0
+            )
+            capped_body = dict(BODIES["capped-logprobs"])
+            spent = await core.fingerprint_once(
+                fp_client, tgt("reasoner-empty", name="r"), "probe", "prose-256", 120, fp_cfg, 0
+            )
+        check(
+            "fingerprint asks for 20 top logprobs and stores the alternatives",
+            full_body.get("top_logprobs") == core.TOP_LOGPROBS
+            and full_body.get("temperature") == 0.0
+            and full.top_logprobs
+            and set(full.top_logprobs[0]) == {"t0", "alt0", "alt1"},
+            str(full.top_logprobs[:1]),
+        )
+        check(
+            'fingerprint honours temperature = "omit" (review #8)',
+            "temperature" not in omit_body and omitted.ok,
+            str(sorted(omit_body)),
+        )
+        check(
+            "a provider that caps top_logprobs at 5 gets 5, and stays in token mode",
+            capped_lp.ok and capped_lp.mode == "tokens" and capped_body.get("top_logprobs") == 5,
+            f"{capped_lp.mode} {capped_body.get('top_logprobs')} {capped_lp.error}",
+        )
+        check(
+            "reasoning that ate the budget is named, with the fix",
+            core.error_class(spent.__dict__) == "reasoning_consumed_budget"
+            and "--max-tokens" in (spent.error or "")
+            and spent.reasoning_tokens == 160,
+            str(spent.error),
+        )
+        spent_summary = core.fingerprint_summary([spent], ["r"], ["prose-256"])
+        spent_report = core.fingerprint_reports([spent], ["r"], ["prose-256"])
+        check(
+            "prompt_tokens signature survives a failed completion (v1 said 'none reported')",
+            spent_summary["prompt_tokens"] == {"r": 78}
+            and "No provider reported" not in spent_report
+            and spent_summary["reasoning_seen"] == ["r"],
+            str(spent_summary["prompt_tokens"]),
+        )
+
+        sent: list[dict] = []
+
+        def openrouter(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+
+        router = core.Target(
+            name="or", base_url="https://openrouter.ai/api/v1", model="m", api_key="k"
+        )
+        router_on = core.Target(
+            name="or-on",
+            base_url="https://openrouter.ai/api/v1",
+            model="m",
+            api_key="k",
+            extra_body={"reasoning": {"enabled": True}},
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(openrouter)) as mocked:
+            for t in (router, router_on, alpha):
+                await core.fingerprint_once(mocked, t, "probe", "prose-256", 120, fp_cfg, 0)
+        check(
+            "fingerprint turns reasoning off on OpenRouter; extra_body can turn it back on",
+            sent[0].get("reasoning") == {"enabled": False}
+            and sent[1].get("reasoning") == {"enabled": True}
+            and "reasoning" not in sent[2],
+            str([s.get("reasoning") for s in sent]),
         )
 
         print("discover (offline fixture):")
@@ -1027,16 +1192,44 @@ async def main() -> int:
                 "--price",
                 "0.1,0.2",
                 "--reps",
-                "1",
+                "2",
                 "-o",
                 "oneshot",
             ],
             work,
         )
         check(
-            "...but re-running into its own run dir is fine",
+            "...but re-running the same flags into its own run dir is fine",
             rerun.returncode == 0,
             rerun.stderr[-200:],
+        )
+        edited = saved.read_text(encoding="utf-8") + "# my edit\n"
+        saved.write_text(edited, encoding="utf-8")
+        before_seen = len(SEEN)
+        reclobber = tps(
+            [
+                "run",
+                "--base-url",
+                base,
+                "--model",
+                "test-model",
+                "--name",
+                "direct",
+                "--price",
+                "0.1,0.2",
+                "--reps",
+                "2",
+                "-o",
+                "oneshot",
+            ],
+            work,
+        )
+        check(
+            "...and a tps-written config someone edited is never replaced either",
+            reclobber.returncode == 1
+            and saved.read_text(encoding="utf-8") == edited
+            and len(SEEN) == before_seen,
+            reclobber.stderr[-200:],
         )
         (work / "init-ep.toml").unlink(missing_ok=True)
         init_ep = tps(
@@ -1201,7 +1394,7 @@ async def main() -> int:
         check(
             "fingerprint on the Claude API: text mode; thinking that ate the cap is no_data",
             fpc.get("verdict") == "consistent"
-            and fpc.get("no_data", {}).get("tight", "").startswith("no_answer")
+            and fpc.get("no_data", {}).get("tight", "").startswith("reasoning_consumed_budget")
             and fpc.get("self_agreement", {}).get("opus") == 1.0,
             fp_claude.stdout[:300] or fp_claude.stderr[-300:],
         )
@@ -1253,6 +1446,166 @@ async def main() -> int:
             "dry run: the time estimate states its assumption",
             plan.get("est_minutes", 0) > 0 and plan.get("assumed", {}).get("tok_s") > 0,
             str(plan.get("assumed")),
+        )
+
+        print("review fixes (CLI):")
+        (work / "levels.toml").write_text(
+            '[run]\nreps = 2\nconcurrency = [1, 2]\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("thinker", base, "thinker")
+            + target_block("answers", base, "test-model"),
+            encoding="utf-8",
+        )
+        levels = tps(["run", "-c", "levels.toml", "-o", "levels", "--json"], work)
+        level_rows = {r["target"]: r for r in json.loads(levels.stdout or "{}").get("results", [])}
+        thinker_row = level_rows.get("thinker", {})
+        check(
+            "reasoning_only counts every level like ok/n, so `reasoning_only == ok` holds",
+            thinker_row.get("reasoning_only") == thinker_row.get("ok") == 2 * 1 + 2 * 2
+            and thinker_row.get("by_concurrency", {}).get("2", {}).get("reasoning_only") == 4,
+            str({k: thinker_row.get(k) for k in ("reasoning_only", "ok", "n")}),
+        )
+        fastest = next(
+            (
+                line
+                for line in tps(["report", "levels"], work).stdout.splitlines()
+                if "fastest" in line
+            ),
+            "",
+        )
+        check(
+            "a row that timed thinking can't be 'fastest'",
+            "answers" in fastest and "thinker" not in fastest,
+            fastest,
+        )
+        from tps import cli as tps_cli
+
+        starter = core.config_from_text(tps_cli.STARTER_CONFIG, "starter")
+        example = core.load_config(ROOT / "targets.example.toml")
+        check(
+            "starter and example configs leave temperature to the per-API default",
+            starter.temperature is None and example.temperature is None,
+            f"{starter.temperature} {example.temperature}",
+        )
+        tps(
+            [
+                "run",
+                "--base-url",
+                base,
+                "--model",
+                "test-model",
+                "--reps",
+                "1",
+                "--max-tokens",
+                "64",
+                "--no-warmup",
+                "-o",
+                "saved5",
+            ],
+            work,
+        )
+        saved5 = core.load_config(work / "saved5" / "targets.toml")
+        check(
+            "the saved config keeps the flags it ran with (reps, warmup, --max-tokens)",
+            saved5.reps == 1
+            and saved5.warmup == 0
+            and saved5.prompts["prose-256"]["max_tokens"] == 64,
+            f"{saved5.reps} {saved5.warmup} {saved5.prompts['prose-256'].get('max_tokens')}",
+        )
+        (work / "hot.toml").write_text(
+            '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("hot", base, "test-model", "extra_body = { temperature = 0.7 }"),
+            encoding="utf-8",
+        )
+        tps(["run", "-c", "hot.toml", "-o", "hot"], work)
+        hot_meta = json.loads((work / "hot" / "meta.json").read_text())
+        check(
+            "meta records the temperature actually sent (extra_body wins)",
+            hot_meta["targets"][0]["temperature"] == 0.7
+            and BODIES["test-model"].get("temperature") == 0.7,
+            str(hot_meta["targets"][0].get("temperature")),
+        )
+        for argv, field in (
+            (["run", "-c", "local.toml", "--temperature", "nan", "--json"], "temperature"),
+            (
+                [
+                    "run",
+                    "--base-url",
+                    base,
+                    "--model",
+                    "m",
+                    "--price",
+                    "inf,1",
+                    "--dry-run",
+                    "--json",
+                ],
+                "price",
+            ),
+            (["run", "-c", "local.toml", "--timeout", "inf", "--json"], "timeout"),
+        ):
+            bad = tps(argv, work)
+            try:
+                bad_payload = json.loads(bad.stdout)
+            except json.JSONDecodeError:
+                bad_payload = {}
+            message = (bad_payload.get("error") or {}).get("message", "")
+            check(
+                f"non-finite {field} rejected up front as a usage error, JSON stays valid",
+                bad.returncode == 1 and bad_payload.get("ok") is False and field in message,
+                bad.stdout[-200:],
+            )
+        rocket = tps(
+            [
+                "init",
+                "--endpoint",
+                "https://api.example.invalid/v1",
+                "--model",
+                "m\nx",
+                "--name",
+                "fast 🚀",
+                "--out",
+                "rocket.toml",
+            ],
+            work,
+        )
+        rocket_target = (
+            core.load_config(work / "rocket.toml").targets[0]
+            if (work / "rocket.toml").exists()
+            else None
+        )
+        check(
+            "init --endpoint writes valid TOML for emoji names and odd model ids",
+            rocket.returncode == 0
+            and rocket_target is not None
+            and rocket_target.name == "fast 🚀"
+            and rocket_target.model == "m\nx",
+            rocket.stderr[-200:],
+        )
+        port = base.split(":")[2].split("/")[0]
+        secret_url = f"http://user:s3cret@127.0.0.1:{port}/v1"
+        creds = tps(
+            [
+                "run",
+                "--base-url",
+                secret_url,
+                "--model",
+                "test-model",
+                "--reps",
+                "1",
+                "--no-warmup",
+                "-o",
+                "creds",
+                "--json",
+            ],
+            work,
+        )
+        creds_meta = (work / "creds" / "meta.json").read_text(encoding="utf-8")
+        check(
+            "credentials in --base-url never reach the name, meta.json or JSON output",
+            creds.returncode == 0
+            and "s3cret" not in creds.stdout
+            and "s3cret" not in creds_meta
+            and json.loads(creds.stdout)["results"][0]["target"] == f"127.0.0.1:{port}",
+            creds.stdout[:200],
         )
 
         (work / "think.toml").write_text(
@@ -1316,9 +1669,18 @@ async def main() -> int:
             "--max-tokens reaches the request (the thinker answers above its cap)",
             raised_row.get("reasoning_only") == 0
             and raised_row.get("first_content_p50_s") is not None
-            and raised_row.get("notes") == []
+            and not any("measured thinking" in n for n in raised_row.get("notes", []))
             and raised_meta.get("max_tokens") == {"prose-256": 400},
             f"{raised_row.get('reasoning_only')} {raised_meta.get('max_tokens')}",
+        )
+        # the thinker streams ~10 tokens of reasoning text but bills 300: the
+        # unstreamed 290 are hidden, kept out of tok/s, and flagged as an estimate
+        check(
+            "partly streamed reasoning: the unstreamed rest is hidden and flagged ≈",
+            raised_row.get("hidden_reasoning_tokens_median") == THINK - 10
+            and "usage+chars/4" in raised_row.get("count_source", [])
+            and any("thinking tokens" in n for n in raised_row.get("notes", [])),
+            str({k: raised_row.get(k) for k in ("hidden_reasoning_tokens_median", "count_source")}),
         )
 
         (work / "dup.toml").write_text(

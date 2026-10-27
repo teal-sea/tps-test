@@ -12,7 +12,7 @@
 reps = 7                # repetitions per (prompt, concurrency). 7 is a floor.
 concurrency = [1, 4]    # 1 = single-stream latency; 4 = queueing behaviour
 warmup = 2              # discarded requests per target (TLS + cold start)
-temperature = 0.0
+# temperature = 0.0    # the default; never sent to api = "anthropic" targets
 timeout_s = 180
 prompts = ["prose-256", "code-256"]
 # max_tokens_field = "max_tokens"   # use "max_completion_tokens" for o-series/GPT-5

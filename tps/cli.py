@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import io
 import json
+import math
 import os
 import sys
 from datetime import UTC, datetime
@@ -40,7 +41,7 @@ STARTER_CONFIG = """\
 reps = 7
 concurrency = [1, 4]
 warmup = 2
-temperature = 0.0
+# temperature = 0.0    # the default; never sent to api = "anthropic" targets
 prompts = ["prose-256"]
 # baseline = "my-direct-endpoint"   # adds Δ columns to the report
 
@@ -118,12 +119,17 @@ def _price_pair(text: str | None) -> tuple[float, float] | None:
         raise core.UsageError(
             f"--price takes IN,OUT in USD per 1M tokens, e.g. 0.14,0.42 — got {text!r}"
         ) from None
-    if price_in < 0 or price_out < 0:
-        raise core.UsageError("--price cannot be negative")
+    if not all(math.isfinite(p) and p >= 0 for p in (price_in, price_out)):
+        raise core.UsageError(f"--price takes two finite, non-negative numbers — got {text!r}")
     return price_in, price_out
 
 
-def endpoint_config(url: str | None, args: argparse.Namespace, flag: str) -> str | None:
+def endpoint_config(
+    url: str | None,
+    args: argparse.Namespace,
+    flag: str,
+    run_block: str = core.DEFAULT_RUN_TOML,
+) -> str | None:
     """A one-target config from flags, for endpoints no gateway lists.
 
     Returns None when `flag` wasn't given, after rejecting the flags that
@@ -152,6 +158,7 @@ def endpoint_config(url: str | None, args: argparse.Namespace, flag: str) -> str
         _price_pair(args.price),
         source=f"tps {args.command} {flag}",
         api=args.api or "openai",
+        run_block=run_block,
     )
 
 
@@ -233,6 +240,8 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "aggregate_tps": _r(level["aggregate_tps"], 2),
                 "ok": level["ok"],
                 "n": level["n"],
+                "truncated": level["truncated"],
+                "reasoning_only": level["reasoning_only"],
                 "errors": level["errors"],
             }
         rows.append(
@@ -255,8 +264,9 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "bursty": st["bursty"],
                 "e2e_p50_s": _r(st["e2e_p50_s"]),
                 "out_tokens_median": st["out_tokens_median"],
-                "truncated": st["truncated"],
-                "reasoning_only": st["reasoning_only"],
+                # every concurrency level, like ok/n (per level: by_concurrency)
+                "truncated": total["truncated"],
+                "reasoning_only": total["reasoning_only"],
                 "hidden_reasoning_tokens_median": st["hidden_reasoning_tokens_median"],
                 "notes": core.row_notes(st),
                 "ok": total["ok"],
@@ -288,6 +298,11 @@ def _ms(value: float | None) -> str:
     return "—" if value is None else f"{value:.0f}ms"
 
 
+def _thinking(row: dict[str, Any]) -> bool:
+    """Some responses at the row's own (lowest) level were reasoning only."""
+    return bool(row["by_concurrency"][str(row["concurrency"])].get("reasoning_only"))
+
+
 def _best(rows: list[dict[str, Any]], key, lowest: bool) -> float | None:
     values = [key(r) for r in rows if key(r) is not None]
     if len(values) < 2:
@@ -306,7 +321,8 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     show_delta = bool(base and base["ttft_p50_s"] is not None and base["out_tps_p50"])
     peak = max((r["out_tps_p50"] or 0 for r in rows), default=0)
 
-    best_tps = _best(rows, lambda r: r["out_tps_p50"], lowest=False)
+    # a rate that timed thinking, not an answer, can't be "fastest"
+    best_tps = _best(rows, lambda r: None if _thinking(r) else r["out_tps_p50"], lowest=False)
     best_ttft = _best(rows, lambda r: r["ttft_p50_s"], lowest=True)
     # a bursty ITL measures the proxy's flushing; it can't win "lowest ITL"
     best_itl = _best(rows, lambda r: None if r["bursty"] else r["itl_p50_ms"], lowest=True)
@@ -331,7 +347,7 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     estimated = False
     table = []
     for r in rows:
-        est = "chars/4" in r["count_source"]
+        est = core.is_estimated(r["count_source"])
         estimated |= est
         ok, n = r["by_concurrency"][level]["ok"], r["by_concurrency"][level]["n"]
         ok_style = ui.green if ok == n else ui.red if ok == 0 else ui.yellow
@@ -433,7 +449,7 @@ def print_rankings(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     if ui.silent or len(rows) < 2:
         return
     lines = []
-    rated = [r for r in rows if r["out_tps_p50"] is not None]
+    rated = [r for r in rows if r["out_tps_p50"] is not None and not _thinking(r)]
     if rated:
         fastest = max(rated, key=lambda r: r["out_tps_p50"])
         lines.append(("▲", "fastest", fastest["target"], f"{fastest['out_tps_p50']:.1f} tok/s"))
@@ -529,7 +545,7 @@ def print_fingerprint(
     ui.say()
     tokens = {}
     for target, count in summary["prompt_tokens"].items():
-        if count is not None and target in present:
+        if count is not None:  # the input's count, valid even if the reply failed
             tokens.setdefault(count, []).append(target)
     if len(tokens) > 1:
         ui.warn(f"tokenizer: {len(tokens)} different prompt-token counts for the same input")
@@ -700,7 +716,7 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     ui.header("init")
     ui.say()
     if text is not None:
-        url = core.config_from_text(text, "--endpoint").targets[0].base_url  # validates too
+        url = core.redact_url(core.config_from_text(text, "--endpoint").targets[0].base_url)
         out.write_text(text, encoding="utf-8")
         ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} at {url}")
         export = f"export {args.api_key_env}=… && " if args.api_key_env else ""
@@ -915,14 +931,17 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
 
     outdir = args.out or Path("runs") / stamp()
     if text is not None:
-        # keep the flags as a config next to the results: repeatable, extendable
-        outdir.mkdir(parents=True, exist_ok=True)
+        # Keep the run as a config next to its results — with the settings it
+        # actually ran with (--reps, --max-tokens, …), so `-c` repeats it.
+        text = endpoint_config(args.endpoint_url, args, "--base-url", core.run_toml(cfg))
         path = outdir / "targets.toml"
         if path.exists() and path.read_text(encoding="utf-8") != text:
-            # `-o .` next to a hand-written config must never replace it
+            # `-o .` next to a hand-written (or hand-edited) config must never
+            # replace it
             raise core.UsageError(
                 f"{path} already exists and isn't this run's config — pick another -o"
             )
+        outdir.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     total = core.planned_requests(cfg)
     ui.header("run", _models_label(cfg), mock=args.mock)

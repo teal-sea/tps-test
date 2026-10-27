@@ -58,7 +58,9 @@ ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
 - **Native, not the OpenAI-compatible layer.** Anthropic also serves
   `/v1/chat/completions`, but only for API keys; Claude subscription (OAuth)
   tokens are rejected there. The native API takes both: an `sk-ant-api…` key is
-  sent as `x-api-key`, anything else as a bearer token.
+  sent as `x-api-key`, anything else as a bearer token, and an OAuth token
+  (`sk-ant-oat…`) also gets the `anthropic-beta: oauth-2025-04-20` header it
+  needs.
 - **No `temperature`.** Claude 4.7 and later reject sampling parameters, so it
   isn't sent to `api = "anthropic"` targets unless you set a number explicitly.
   (On the OpenAI-compatible layer they reject `temperature: 0` too — use

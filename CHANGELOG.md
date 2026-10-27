@@ -33,6 +33,12 @@ First public release.
 - Native Claude API targets (`api = "anthropic"`, `--api anthropic`): works with
   API keys and Claude subscription tokens, which Anthropic's OpenAI-compatible
   endpoint rejects. `--temperature omit` / `temperature = "omit"`.
+- Fingerprint groundwork for richer comparisons: 20 `top_logprobs` per token (5
+  where a provider caps it), every alternative kept in `fingerprints.jsonl`;
+  reasoning turned off on OpenRouter; `reasoning_seen` lists targets that
+  reasoned anyway, and one that spent the budget reasoning is `no_data`
+  (`reasoning_consumed_budget`) with a hint. The tokenizer signature reads
+  `prompt_tokens` from any rep that reported it, failed completions included.
 
 ### Fixed before release
 
@@ -59,9 +65,35 @@ First public release.
 - `tps run --base-url -o DIR` overwrote an existing `DIR/targets.toml` (e.g. a
   hand-written config with `-o .`); it now refuses before sending anything.
 - The fingerprint agreement box overflowed with only two targets.
+- From a code review of the above:
+    - `truncated` / `reasoning_only` counted only the lowest concurrency; they
+      count every level, with `by_concurrency` per level.
+    - A response with nothing streamed counted as `ok` when it was a
+      `content_filter` / `refusal` decline or a billed empty answer
+      (`no_content`); a Claude stream cut off before `message_stop` counted as
+      `ok` with a placeholder token count (`incomplete_stream`).
+    - A reasoning-only row could win "best tok/s" and "fastest".
+    - Claude OAuth tokens (`sk-ant-oat…`) were sent without the
+      `anthropic-beta: oauth-2025-04-20` header they need.
+    - The starter config set `temperature = 0`, which Claude API targets reject.
+    - `stream_options` and fingerprint `logprobs` overwrote the same keys in
+      `extra_body`; `extra_body` now wins.
+    - `fingerprint` sent `temperature: 0` even under `--temperature omit`, and
+      `meta.json` recorded the config's temperature rather than what each
+      target was sent.
+    - The config saved by `run --base-url` dropped `--reps`, `--max-tokens` and
+      the other overrides, so `-c` didn't repeat the run.
+    - `nan` / `inf` were accepted as a temperature, price or timeout.
+    - A name or model with quotes or control characters produced an invalid
+      generated TOML; a `user:password@` in a `--base-url` leaked into the
+      default target name, `meta.json` and the report.
+    - One long stall made a steady stream look bursty; the burst test now
+      compares against the mean without its longest 2% of gaps.
+    - Reasoning that was only partly streamed (a summary) credited the hidden
+      remainder to tok/s; it is now estimated and flagged `usage+chars/4`.
 - A stream coalesced by a proxy showed a 1 ms ITL next to 138 tok/s with nothing
   saying why, and won "best ITL". Bursty delivery is now detected (median gap <
-  20% of the mean), marked `†`, noted, and excluded from "best"; rows gain
+  20% of the typical gap), marked `†`, noted, and excluded from "best"; rows gain
   `tokens_per_chunk_median`, `bursty`, `itl_n` and `first_content_n`.
 - The selftest's no-buffering check used a wall-clock budget that a cold first
   connection could exceed; it now compares against the same request's end. A

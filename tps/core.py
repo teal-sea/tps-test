@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import os
 import statistics
 import sys
@@ -66,6 +67,7 @@ class ProviderError(TpsError):
 USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
 
 ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 APIS = ("openai", "anthropic")
 # Claude API stop reasons in OpenAI's vocabulary, so one report covers both
 ANTHROPIC_STOP = {
@@ -219,10 +221,13 @@ class Target:
     def auth_headers(self) -> dict[str, str]:
         key = self.key()
         if self.api == "anthropic":
-            # API keys go in x-api-key; OAuth / session tokens are bearer tokens
+            # API keys go in x-api-key; OAuth / session tokens are bearer tokens,
+            # and a Claude subscription OAuth token also needs the oauth beta
             auth = {"x-api-key": key} if key.startswith("sk-ant-api") else {}
             if key and not auth:
                 auth = {"Authorization": f"Bearer {key}"}
+            if key.startswith("sk-ant-oat"):
+                auth["anthropic-beta"] = ANTHROPIC_OAUTH_BETA
             return {"anthropic-version": ANTHROPIC_VERSION, **auth}
         return {"Authorization": f"Bearer {key}"} if key else {}
 
@@ -236,12 +241,17 @@ class Target:
         return ""
 
     def secrets(self) -> list[str]:
-        """The API key plus any credential-looking header values (x-api-key, …)."""
+        """The API key, credential-looking header values (x-api-key, …) and any
+        password embedded in the base URL."""
         values = [self.key()]
         for name, value in self.headers.items():
             if isinstance(value, str) and any(h in name.lower() for h in SECRET_HEADER_HINTS):
                 values.append(value)
                 values.append(value.removeprefix("Bearer ").strip())
+        try:
+            values.append(urlparse(self.base_url).password or "")
+        except ValueError:
+            pass
         return [v for v in values if v]
 
     def needs_key(self) -> bool:
@@ -285,8 +295,8 @@ def validate(cfg: RunConfig, where: str = "config") -> None:
         )
     if cfg.warmup < 0:
         raise UsageError(f"{where}: warmup cannot be negative")
-    if cfg.timeout_s <= 0:
-        raise UsageError(f"{where}: timeout_s must be positive")
+    if not math.isfinite(cfg.timeout_s) or cfg.timeout_s <= 0:
+        raise UsageError(f"{where}: timeout_s must be a positive number of seconds")
     cfg.temperature = parse_temperature(cfg.temperature, where)
     if not cfg.prompts:
         raise UsageError(f"{where}: no prompts selected")
@@ -313,7 +323,7 @@ def parse_temperature(value: Any, where: str) -> float | str | None:
         number = float(value) if not isinstance(value, bool) else -1.0
     except (TypeError, ValueError):
         number = -1.0
-    if number < 0:
+    if not math.isfinite(number) or number < 0:
         raise UsageError(f'{where}: temperature must be a number ≥ 0, or "omit" (got {value!r})')
     return number
 
@@ -331,6 +341,14 @@ def request_temperature(cfg: RunConfig, target: Target) -> float | None:
     return float(cfg.temperature)
 
 
+def sent_temperature(cfg: RunConfig, target: Target) -> Any:
+    """What a request to this target actually carries: extra_body is applied
+    last and may set (or null) temperature itself."""
+    if "temperature" in target.extra_body:
+        return target.extra_body["temperature"]
+    return request_temperature(cfg, target)
+
+
 def _table(entry: dict[str, Any], key: str, label: str, path: Path) -> dict[str, Any]:
     value = entry.get(key) or {}
     if not isinstance(value, dict):
@@ -346,9 +364,12 @@ def _price(value: Any, key: str, label: str, path: Path) -> float | None:
     if isinstance(value, bool):
         raise UsageError(f"{path}: {label}: `{key}` must be a number")
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         raise UsageError(f"{path}: {label}: `{key}` must be a number, got {value!r}") from None
+    if not math.isfinite(number):  # TOML allows inf/nan; JSON output doesn't
+        raise UsageError(f"{path}: {label}: `{key}` must be a finite number, got {value!r}")
+    return number
 
 
 def load_config(path: Path) -> RunConfig:
@@ -362,7 +383,11 @@ def load_config(path: Path) -> RunConfig:
 
 def config_from_text(text: str, label: str) -> RunConfig:
     """A config built in memory (`--base-url` mode), validated like a file."""
-    return config_from_dict(tomllib.loads(text), Path(label))
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise UsageError(f"{label}: can't build a valid config from these flags — {exc}") from exc
+    return config_from_dict(raw, Path(label))
 
 
 def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
@@ -485,6 +510,7 @@ class Sample:
     # A median gap far below the mean means chunks arrived in bursts (a proxy
     # flushing several at once): the ITL then measures delivery, not the model.
     itl_mean_ms: float | None = None
+    itl_pace_ms: float | None = None  # mean gap without the longest few (stalls)
     tokens_per_chunk: float | None = None
     chunks: int = 0
     count_source: str = "usage"
@@ -542,9 +568,9 @@ async def stream_once(
     batch: int,
     send_stream_options: bool,
 ) -> Sample:
-    body = request_body(target, cfg, prompt_text, max_tokens, stream=True)
-    if send_stream_options and target.api == "openai":
-        body["stream_options"] = {"include_usage": True}
+    wants_usage = send_stream_options and target.api == "openai"
+    extra = {"stream_options": {"include_usage": True}} if wants_usage else None
+    body = request_body(target, cfg, prompt_text, max_tokens, stream=True, extra=extra)
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     headers.update(target.auth_headers())
     headers.update(target.headers)
@@ -567,6 +593,7 @@ async def stream_once(
     usage: dict[str, Any] = {}
     served: str | None = None
     stream_error: str | None = None
+    stopped = False  # Claude ends every complete stream with message_stop
 
     try:
         async with client.stream("POST", target.url(), json=body, headers=headers) as response:
@@ -623,6 +650,7 @@ async def stream_once(
                     stream_error = redact(f"stream_error: {message}", target.secrets())[:300]
                     break
                 event = parse_event(obj, target.api)
+                stopped = stopped or event["stop"]
                 usage.update(event["usage"])
                 if event["provider"] and not served:
                     served = event["provider"]
@@ -657,6 +685,9 @@ async def stream_once(
 
     sample.e2e_s = time.perf_counter() - t0
     sample.served_by = served
+    if not stream_error and target.api == "anthropic" and not stopped:
+        # cut off mid-stream (a proxy closing early): its counts can't be trusted
+        stream_error = "incomplete_stream: ended without message_stop"
     if stream_error:
         sample.error = stream_error
         return sample
@@ -686,8 +717,17 @@ async def stream_once(
 
     # Reasoning that was counted in usage but never streamed (Claude's omitted
     # thinking, o-series reasoning) happened before the window opened: crediting
-    # it to the window would inflate tok/s by the thinking share.
-    hidden = (sample.reasoning_tokens or 0) if out_from_usage and not reasoning_chars else 0
+    # it to the window would inflate tok/s by the thinking share. When only a
+    # summary of it streamed, the unstreamed remainder is hidden too — that
+    # split rests on chars/4, so the rate is flagged as estimated.
+    hidden = 0
+    if out_from_usage and sample.reasoning_tokens:
+        shown = round(reasoning_chars / 4)
+        if not reasoning_chars:
+            hidden = sample.reasoning_tokens
+        elif sample.reasoning_tokens > 2 * shown:
+            hidden = sample.reasoning_tokens - shown
+            sample.count_source = "usage+chars/4"
     sample.hidden_reasoning_tokens = hidden
     streamed = (sample.out_tokens or 0) - hidden
     if first is not None and last is not None and last > first and streamed > 0:
@@ -702,21 +742,39 @@ async def stream_once(
             sample.itl_p50_ms = percentile(gaps, 0.5) * 1000
             sample.itl_p90_ms = percentile(gaps, 0.9) * 1000
             sample.itl_mean_ms = sum(gaps) / len(gaps) * 1000
+            pace = itl_pace(gaps)
+            sample.itl_pace_ms = None if pace is None else pace * 1000
     if sample.chunks and streamed > 0:
         sample.tokens_per_chunk = streamed / sample.chunks
     # A single chunk has no decode window: the rate is unknown, not infinite.
 
-    # Billed tokens and a finish_reason but nothing streamed is a model that
-    # only thought (hidden reasoning hit the cap) — a result, not an empty stream.
-    sample.ok = bool(sample.out_tokens and (sample.chunks or sample.finish_reason))
+    finish = sample.finish_reason
+    if finish in ("content_filter", "refusal"):
+        # the provider declined; whatever streamed is not an answer to time
+        sample.error = f"{finish}: finish_reason={finish}"
+    elif sample.chunks:
+        sample.ok = bool(sample.out_tokens)
+    elif finish == "length" and sample.reasoning_tokens:
+        # Nothing streamed, but the cap was spent on billed reasoning: a model
+        # that only thought (Claude's hidden thinking) — a result, flagged as such.
+        sample.ok = True
+    elif finish or sample.out_tokens:
+        sample.error = f"no_content: nothing streamed (finish_reason={finish})"
     if not sample.ok and not sample.error:
         sample.error = "empty_stream"
     return sample
 
 
 def request_body(
-    target: Target, cfg: RunConfig, prompt_text: str, max_tokens: int, stream: bool
+    target: Target,
+    cfg: RunConfig,
+    prompt_text: str,
+    max_tokens: int,
+    stream: bool,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """The JSON body for one request. `extra` holds the fields tps adds for
+    the command (stream_options, logprobs); extra_body still wins over them."""
     body: dict[str, Any] = {
         "model": target.model,
         "messages": [{"role": "user", "content": prompt_text}],
@@ -729,6 +787,7 @@ def request_body(
         body["max_tokens"] = max_tokens
     else:
         body[target.max_tokens_field or cfg.max_tokens_field] = max_tokens
+    body.update(extra or {})
     # extra_body last: it is how provider pinning / vendor flags get applied
     body.update(target.extra_body)
     return body
@@ -742,11 +801,17 @@ def parse_event(obj: dict[str, Any], api: str) -> dict[str, Any]:
         "finish": None,
         "piece": "",
         "reasoning": "",
+        "stop": False,
     }
     if api == "anthropic":
         kind = obj.get("type")
         if kind == "message_start":
-            event["usage"] = (obj.get("message") or {}).get("usage") or {}
+            usage = (obj.get("message") or {}).get("usage") or {}
+            # output_tokens here is a placeholder (≈1); only message_delta's
+            # count is final, so never let a cut-off stream keep it
+            event["usage"] = {k: v for k, v in usage.items() if k != "output_tokens"}
+        elif kind == "message_stop":
+            event["stop"] = True
         elif kind == "message_delta":
             event["usage"] = obj.get("usage") or {}
             stop = (obj.get("delta") or {}).get("stop_reason")
@@ -857,6 +922,7 @@ def mock_sample(
         itl_p50_ms=itl * 1000,
         itl_p90_ms=itl * 1000 * 1.4,
         itl_mean_ms=itl * 1000 * 1.1,  # a steady stream: one token per chunk
+        itl_pace_ms=itl * 1000 * 1.05,
         tokens_per_chunk=1.0,
         chunks=tokens,
         count_source="mock",
@@ -986,12 +1052,12 @@ def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
             {
                 "name": t.name,
                 "model": t.model,
-                "base_url": t.base_url,
+                "base_url": redact_url(t.base_url),  # meta, JSON and report are shared
                 "pin": t.extra_body.get("provider"),
                 "price_in": t.price_in,
                 "price_out": t.price_out,
                 "api": t.api,
-                "temperature": request_temperature(cfg, t),  # null = not sent
+                "temperature": sent_temperature(cfg, t),  # null = not sent
             }
             for t in cfg.targets
         ],
@@ -1137,6 +1203,11 @@ def error_class(sample: dict[str, Any]) -> str:
     return (sample.get("error") or "unknown").split(":")[0]
 
 
+def is_estimated(count_sources: list[str]) -> bool:
+    """True when any token count behind a row came from chars/4."""
+    return any("chars/4" in source for source in count_sources)
+
+
 def is_warmup(sample: dict[str, Any]) -> bool:
     # runs recorded before `phase` existed mark warm-ups with batch -1 only
     return sample.get("phase") == "warmup" or sample.get("batch") == -1
@@ -1176,14 +1247,30 @@ _FIELDS = (
     ("out", "out_tokens"),
 )
 
-# A request whose median chunk gap is under this share of its mean gap got its
-# chunks in bursts. Comparing the stream with itself needs no token counts.
+# A request whose median chunk gap is under this share of its typical gap got
+# its chunks in bursts. Comparing the stream with itself needs no token counts.
 BURST_RATIO = 0.2
 
 
+def itl_pace(gaps: list[float]) -> float | None:
+    """The mean chunk gap with the longest few left out.
+
+    One long stall in a steady stream drags the plain mean up and would make
+    an honest median look like a burst; clumped delivery has a long gap per
+    clump, so dropping just the top 2% (at least two) keeps it visible.
+    """
+    drop = max(2, math.ceil(len(gaps) * 0.02))
+    if len(gaps) <= drop + 2:
+        return None  # too few gaps to tell a burst from a pause
+    kept = sorted(gaps)[:-drop]
+    return sum(kept) / len(kept)
+
+
 def is_bursty(sample: dict[str, Any]) -> bool:
-    p50_gap, mean_gap = sample.get("itl_p50_ms"), sample.get("itl_mean_ms")
-    return bool(p50_gap is not None and mean_gap and p50_gap < BURST_RATIO * mean_gap)
+    p50_gap = sample.get("itl_p50_ms")
+    # rows recorded before itl_pace_ms existed fall back to the plain mean
+    pace = sample["itl_pace_ms"] if "itl_pace_ms" in sample else sample.get("itl_mean_ms")
+    return bool(p50_gap is not None and pace and p50_gap < BURST_RATIO * pace)
 
 
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1205,7 +1292,10 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         key = (s["prompt"], s["target"], s["concurrency"])
         bucket = buckets.setdefault(key, _bucket())
-        total = totals.setdefault((s["prompt"], s["target"]), {"ok": 0, "n": 0, "errors": {}})
+        total = totals.setdefault(
+            (s["prompt"], s["target"]),
+            {"ok": 0, "n": 0, "truncated": 0, "reasoning_only": 0, "errors": {}},
+        )
         bucket["n"] += 1
         total["n"] += 1
         bkey = (*key, s["batch"])
@@ -1215,9 +1305,14 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
             total["ok"] += 1
             bucket["served"].add(s.get("served_by"))
             bucket["count_source"].add(s.get("count_source"))
-            bucket["truncated"] += s.get("finish_reason") == "length"
+            truncated = s.get("finish_reason") == "length"
             # every chunk was reasoning: there is no answer to time
-            bucket["reasoning_only"] += s.get("first_content_s") is None
+            reasoning_only = s.get("first_content_s") is None
+            bucket["truncated"] += truncated
+            bucket["reasoning_only"] += reasoning_only
+            # counted at every level, like ok/n, so `reasoning_only == ok` holds
+            total["truncated"] += truncated
+            total["reasoning_only"] += reasoning_only
             bucket["hidden"].append(s.get("hidden_reasoning_tokens") or 0)
             bucket["bursty"] += is_bursty(s)
             for name, source in _FIELDS:
@@ -1310,7 +1405,7 @@ def row_notes(st: dict[str, Any]) -> list[str]:
         tpc = st["tokens_per_chunk_median"]
         notes.append(
             f"chunks arrived in bursts in {st['bursty']}/{st['itl_n']} responses (median gap "
-            f"under {BURST_RATIO:.0%} of the mean) — ITL measures how the stream was "
+            f"under {BURST_RATIO:.0%} of the typical gap) — ITL measures how the stream was "
             "flushed, not the model's pacing" + (f" ({tpc:.1f} tokens/chunk)" if tpc else "")
         )
     return notes
@@ -1445,7 +1540,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
 
         for target, bucket in rows:
             st = bucket_stats(bucket)
-            estimated = "chars/4" in st["count_source"]
+            estimated = is_estimated(st["count_source"])
             estimated_any |= estimated
             mark = " ≈" if estimated else ""
             cells = [target, fmt(st["ttft_p50_s"], 2), fmt(st["ttft_p90_s"], 2)]
@@ -1535,8 +1630,9 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
 
     if estimated_any:
         lines.append(
-            "> ≈ token counts were estimated as chars/4 because the provider sent no "
-            "`usage` block. Treat those rates as approximate."
+            "> ≈ token counts were estimated as chars/4 — the provider sent no `usage` "
+            "block, or (`usage+chars/4`) only a summary of its billed reasoning streamed "
+            "and the streamed/hidden split was estimated. Treat those rates as approximate."
         )
         lines.append("")
 
@@ -1839,6 +1935,50 @@ def targets_toml(canonical: str, endpoints: list[dict[str, Any]]) -> tuple[str, 
     return "\n".join(blocks), len(groups), collapsed
 
 
+def redact_url(url: str) -> str:
+    """The URL without its user:password@ part, for anything that gets shared."""
+    try:
+        parsed = urlparse(url)
+        if not (parsed.username or parsed.password):
+            return url
+        host = parsed.hostname or ""
+        host = f"[{host}]" if ":" in host else host
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return url
+    return parsed._replace(netloc=f"***@{host}{port}").geturl()
+
+
+def _comment(text: str) -> str:
+    # a newline in a TOML comment would end it and turn the rest into config
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
+def run_toml(cfg: RunConfig) -> str:
+    """A [run] section (plus any overridden built-in prompt caps) that
+    reproduces cfg's effective settings, flags included."""
+    lines = [
+        "[run]",
+        f"reps = {cfg.reps}",
+        f"concurrency = {_toml_inline(cfg.concurrency)}",
+        f"warmup = {cfg.warmup}",
+        f"timeout_s = {_toml_inline(cfg.timeout_s)}",
+        f"prompts = {_toml_inline(list(cfg.prompts))}",
+    ]
+    if cfg.temperature is not None:
+        lines.append(f"temperature = {_toml_inline(cfg.temperature)}")
+    if cfg.max_tokens_field != "max_tokens":
+        lines.append(f"max_tokens_field = {_toml_inline(cfg.max_tokens_field)}")
+    for name, spec in cfg.prompts.items():
+        cap = int(spec.get("max_tokens", 256))
+        if cap != int(DEFAULT_PROMPTS.get(name, {}).get("max_tokens", -1)):
+            lines += ["", f"[prompts.{_toml_key(name)}]", f"max_tokens = {cap}"]
+    return "\n".join(lines)
+
+
+DEFAULT_RUN_TOML = '[run]\nreps = 7\nconcurrency = [1]\nprompts = ["prose-256"]'
+
+
 def endpoint_toml(
     base_url: str,
     model: str,
@@ -1847,26 +1987,27 @@ def endpoint_toml(
     price: tuple[float, float] | None = None,
     source: str = "tps init --endpoint",
     api: str = "openai",
+    run_block: str = DEFAULT_RUN_TOML,
 ) -> str:
     """A one-target config for any OpenAI-compatible endpoint, no gateway needed.
 
     `tps init --endpoint` writes it; `tps run --base-url` builds it in memory
-    and saves a copy in the run directory so the run can be repeated.
+    and saves a copy, with the run's effective settings, in the run directory
+    so the run can be repeated.
     """
     parsed = urlparse(base_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise UsageError(f"not an http(s) URL: {base_url!r} — e.g. https://api.example.com/v1")
+    # never the netloc: a user:password@ in the URL must not become the name
+    default_name = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
     lines = [
-        f"# generated by: {source} {base_url} --model {model}",
+        _comment(f"# generated by: {source} {redact_url(base_url)} --model {model}"),
         "# add more [[targets]] blocks to compare providers side by side",
         "",
-        "[run]",
-        "reps = 7",
-        "concurrency = [1]",
-        'prompts = ["prose-256"]',
+        run_block,
         "",
         "[[targets]]",
-        f"name = {_toml_inline(name or parsed.netloc)}",
+        f"name = {_toml_inline(name or default_name)}",
         f"base_url = {_toml_inline(base_url)}",
         f"model = {_toml_inline(model)}",
     ]
@@ -1943,15 +2084,24 @@ def _per_million(value: Any) -> float | None:
 
 def _toml_inline(value: Any) -> str:
     if isinstance(value, dict):
-        inner = ", ".join(f"{k} = {_toml_inline(v)}" for k, v in value.items())
+        inner = ", ".join(f"{_toml_key(k)} = {_toml_inline(v)}" for k, v in value.items())
         return "{ " + inner + " }"
     if isinstance(value, list):
         return "[" + ", ".join(_toml_inline(v) for v in value) + "]"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        return json.dumps(value)  # JSON string escapes are valid TOML basic strings
+        # JSON escapes are valid TOML basic-string escapes, but ensure_ascii's
+        # surrogate pairs (🚀) are not: keep non-ASCII literal, and
+        # escape DEL, the one control character JSON leaves alone
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
     return str(value)
+
+
+def _toml_key(key: Any) -> str:
+    key = str(key)
+    bare = key and all(c.isascii() and (c.isalnum() or c in "-_") for c in key)
+    return key if bare else _toml_inline(key)
 
 
 # --------------------------------------------------------------------------
@@ -1990,9 +2140,25 @@ class Fingerprint:
     text: str = ""
     tokens: list[str] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
+    # per position, the provider's top alternatives {token: logprob} — the raw
+    # material for distribution tests, not just the sampled token's logprob
+    top_logprobs: list[dict[str, float]] = field(default_factory=list)
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    reasoning_tokens: int | None = None  # nonzero = reasoning stayed on
     mode: str = "tokens"  # "tokens" | "text" (no logprobs support)
+
+
+TOP_LOGPROBS = 20  # OpenAI's maximum; providers that cap lower get FALLBACK_TOP_LOGPROBS
+FALLBACK_TOP_LOGPROBS = 5
+REASONING_CONSUMED = (
+    "reasoning_consumed_budget: the model spent max_tokens reasoning and never answered "
+    "— raise --max-tokens, or turn reasoning off for this target"
+)
+
+
+def is_openrouter(target: Target) -> bool:
+    return (urlparse(target.base_url).hostname or "").endswith("openrouter.ai")
 
 
 async def fingerprint_once(
@@ -2004,17 +2170,22 @@ async def fingerprint_once(
     cfg: RunConfig,
     rep: int,
     use_logprobs: bool = True,
+    top_k: int = TOP_LOGPROBS,
 ) -> Fingerprint:
-    # Greedy where the API allows it. The Claude API rejects sampling settings
-    # and has no logprobs, so Claude is compared on text and its self-agreement
-    # decides whether it can be placed at all.
-    body = request_body(target, replace(cfg, temperature=0.0), prompt_text, max_tokens, False)
+    # Greedy where the API allows it, and "omit" is honoured for models that
+    # reject temperature. The Claude API rejects sampling settings and has no
+    # logprobs, so Claude is compared on text and its self-agreement decides
+    # whether it can be placed at all.
+    greedy = replace(cfg, temperature="omit" if cfg.temperature == "omit" else None)
     use_logprobs = use_logprobs and target.api == "openai"
+    extra: dict[str, Any] = {}
     if use_logprobs:
-        body["logprobs"] = True
-        body["top_logprobs"] = 5
-    if target.api == "anthropic":
-        body.pop("temperature", None)
+        extra.update(logprobs=True, top_logprobs=top_k)
+    if is_openrouter(target):
+        # reasoning makes greedy traces longer and noisier and can eat the whole
+        # budget; extra_body can still turn it back on
+        extra["reasoning"] = {"enabled": False}
+    body = request_body(target, greedy, prompt_text, max_tokens, False, extra=extra)
 
     headers = {"Content-Type": "application/json"}
     headers.update(target.auth_headers())
@@ -2025,7 +2196,21 @@ async def fingerprint_once(
         response = await client.post(target.url(), json=body, headers=headers)
         if response.status_code >= 400:
             text = redact(response.text, target.secrets())[:600]
-            if use_logprobs and response.status_code in (400, 422) and "logprob" in text.lower():
+            compat = use_logprobs and response.status_code in (400, 422)
+            if compat and "top_logprobs" in text.lower() and top_k > FALLBACK_TOP_LOGPROBS:
+                # some providers cap top_logprobs (often at 5): ask for fewer
+                return await fingerprint_once(
+                    client,
+                    target,
+                    prompt_text,
+                    prompt_name,
+                    max_tokens,
+                    cfg,
+                    rep,
+                    True,
+                    FALLBACK_TOP_LOGPROBS,
+                )
+            if compat and "logprob" in text.lower():
                 # provider doesn't implement logprobs; exact-text mode still
                 # detects "different model" but not "same model, different quant"
                 return await fingerprint_once(
@@ -2052,6 +2237,13 @@ async def fingerprint_once(
     result.completion_tokens = _first_present(
         usage.get("completion_tokens"), usage.get("output_tokens")
     )
+    for key, name in (
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "thinking_tokens"),
+    ):
+        details = usage.get(key)
+        if isinstance(details, dict) and details.get(name) is not None:
+            result.reasoning_tokens = details[name]
 
     if target.api == "anthropic":
         blocks = payload.get("content") or []
@@ -2062,11 +2254,7 @@ async def fingerprint_once(
         result.ok = bool(result.text)
         if not result.ok:
             capped = payload.get("stop_reason") == "max_tokens"
-            result.error = (
-                "no_answer: hit max_tokens while thinking — raise --max-tokens"
-                if capped
-                else "empty_response"
-            )
+            result.error = REASONING_CONSUMED if capped else "empty_response"
         return result
 
     choices = payload.get("choices") or []
@@ -2084,11 +2272,22 @@ async def fingerprint_once(
             continue
         result.tokens.append(token)
         result.logprobs.append(item.get("logprob"))
+        alternatives = item.get("top_logprobs") or []
+        result.top_logprobs.append(
+            {
+                alt["token"]: alt.get("logprob")
+                for alt in alternatives
+                if isinstance(alt, dict) and alt.get("token") is not None
+            }
+        )
     if not result.tokens:
         result.mode = "text"
     result.ok = bool(result.text or result.tokens)
-    if not result.ok and not result.error:
-        result.error = "empty_response"
+    if not result.ok:
+        thought = (
+            message.get("reasoning") or message.get("reasoning_content") or result.reasoning_tokens
+        )
+        result.error = REASONING_CONSUMED if thought else "empty_response"
     return result
 
 
@@ -2278,10 +2477,24 @@ def fingerprint_summary(
             pairs.append(
                 {"a": a_name, "b": b_name, "agreement": round(frac, 4), "first_divergence": first}
             )
+    # The tokenizer signature is the prompt's usage.prompt_tokens, which is
+    # valid even when the completion failed (reasoning ate the budget): take it
+    # from any rep of the probe prompt, not only from rep 0 that succeeded.
     prompt_tokens = {
-        t: (by_key[(t, prompt, 0)].prompt_tokens if (t, prompt, 0) in by_key else None)
+        t: next(
+            (
+                f.prompt_tokens
+                for f in prints
+                if f.target == t and f.prompt == prompt and f.prompt_tokens is not None
+            ),
+            None,
+        )
         for t in targets
     }
+    reasoning_seen = sorted(
+        {f.target for f in prints if f.prompt == prompt and (f.reasoning_tokens or 0) > 0},
+        key=targets.index,
+    )
     return {
         "verdict": verdict,
         "clusters": clusters,
@@ -2294,6 +2507,8 @@ def fingerprint_summary(
         "self_first_divergence": {k: f for k, (_v, f) in selfs.items()},
         "pairs": pairs,
         "prompt_tokens": prompt_tokens,
+        # targets that reasoned anyway (reasoning off was asked for, or isn't possible)
+        "reasoning_seen": reasoning_seen,
         "prompt_used": prompt,
     }
 
@@ -2306,11 +2521,18 @@ def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: 
 
     lines: list[str] = ["# Fingerprint: same weights or just the same name?", ""]
     lines.append(
-        "Greedy decode (temp 0). `self` = the provider's agreement with itself "
-        "across reps — its noise floor. Agreement below that floor is not "
-        "evidence of different weights."
+        "Greedy decode (temp 0) where the API allows it, reasoning off where it can be "
+        "turned off. `self` = the provider's agreement with itself across reps — its "
+        "noise floor. Agreement below that floor is not evidence of different weights."
     )
     lines.append("")
+    if summary["reasoning_seen"]:
+        lines.append(
+            f"⚠ Reasoned anyway: {', '.join(summary['reasoning_seen'])} — reasoning tokens "
+            "were billed despite the request (or can't be disabled). Their traces include "
+            "reasoning, which makes them longer and noisier."
+        )
+        lines.append("")
 
     # 1. tokenizer / template signature
     lines.append("## Tokenizer & chat-template signature")
@@ -2323,7 +2545,9 @@ def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: 
             (by_key[(target, p, 0)] for p in prompts if (target, p, 0) in by_key),
             None,
         )
-        value = item.prompt_tokens if item and item.ok else None
+        # usage.prompt_tokens describes the input, so it counts even when the
+        # completion itself failed
+        value = summary["prompt_tokens"].get(target)
         if value is not None:
             signatures.setdefault(value, set()).add(target)
         completion = item.completion_tokens if item and item.ok else None

@@ -116,7 +116,9 @@ tps run --api anthropic --model ID --api-key-env VAR [...]      # native Claude 
 **No config file:** `--base-url URL --model ID` measures one OpenAI-compatible
 endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 --endpoint`; it can't be combined with `-c`). The generated config is saved as
-`<run_dir>/targets.toml`, so the run can be repeated or extended. `--api
+`<run_dir>/targets.toml` with the settings the run actually used (`--reps`,
+`--max-tokens`, `--temperature`, …), so `-c` repeats it exactly; a different
+`targets.toml` already there is never replaced (pick another `-o`). `--api
 anthropic` speaks the native Claude Messages API instead (URL defaults to
 `https://api.anthropic.com/v1`; takes API keys and Claude subscription tokens) —
 see [configuration](configuration.md#claude-api-anthropic).
@@ -159,8 +161,12 @@ tps fingerprint [-c FILE] [-o DIR] [--reps 2] [--prompt-count 2] [--max-tokens 1
                 [--timeout S] [--mock]
 ```
 
-Sends the same prompt `--reps` times per target at temperature 0, non-streaming,
-with `logprobs`, and compares token sequences. Writes `fingerprints.jsonl` +
+Sends the same prompt `--reps` times per target at temperature 0 (unless the
+config says `temperature = "omit"`), non-streaming, with `logprobs` and 20
+`top_logprobs` (5 where a provider caps it), and compares token sequences. On
+OpenRouter targets reasoning is turned off (`reasoning = {enabled = false}`;
+`extra_body.reasoning` overrides). Writes `fingerprints.jsonl` — each row keeps
+the full `top_logprobs` per position and any `reasoning_tokens` — and
 `fingerprint.md`. Exits 4 if no request succeeded. `fingerprints.jsonl` is
 written as requests finish; Ctrl-C keeps them and writes a `PARTIAL` report.
 See [fingerprinting](fingerprinting.md).
@@ -226,20 +232,27 @@ Three counts, three meanings: `total` is measured requests (warm-ups excluded);
 tagged `"phase": "warmup"` or `"measure"`. `results[].n` is one (prompt,
 target)'s measured requests across all concurrency levels.
 
-`truncated` and `reasoning_only` count responses at the lowest concurrency that
-stopped at `max_tokens` (`finish_reason: "length"`) and that contained no answer
-text at all. The built-in prompts ask for more than their cap, so `truncated` is
-normally everything; `reasoning_only` is the one to watch. When it is non-zero,
+`truncated` and `reasoning_only` count successful responses that stopped at
+`max_tokens` (`finish_reason: "length"`) and that contained no answer text at all
+— across **every** concurrency level, like `ok`/`n`, so `reasoning_only == ok`
+means no response answered (per level: `by_concurrency`). The built-in prompts ask
+for more than their cap, so `truncated` is normally everything; `reasoning_only`
+is the one to watch. A response that was filtered (`content_filter`), refused
+(`refusal`) or billed with nothing streamed for another reason (`no_content`) is
+a failure, not a reasoning-only success. When `reasoning_only` is non-zero,
 `notes` says what that does to the row — e.g. a reasoning model that spent its
 whole cap thinking has a real TTFT and tok/s *for the thinking*, and no
 first-answer time or ITL; raise `--max-tokens`.
 `hidden_reasoning_tokens_median` is reasoning the provider billed but didn't
 stream (Claude's thinking); it is excluded from tok/s, and `notes` says TTFT
-includes it.
+includes it. When only a summary of the reasoning streamed, the unstreamed rest
+counts as hidden too; that split rests on chars/4, so `count_source` reads
+`usage+chars/4` and the rate is marked ≈.
 
 `itl_n` / `first_content_n` are how many requests those medians came from
 (reasoning-only and single-chunk responses contribute nothing). `bursty` counts
-requests whose chunks arrived in clumps (median gap < 20% of the mean): their ITL
+requests whose chunks arrived in clumps (median gap < 20% of the typical gap —
+the mean with the longest 2% left out, so one stall isn't a burst): their ITL
 measures a proxy's flushing, not the model — see
 [metrics](metrics.md#itl-inter-token-latency). `tokens_per_chunk_median` is what
 reconciles ITL with tok/s.

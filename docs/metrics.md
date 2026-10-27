@@ -55,8 +55,9 @@ clumps — many arriving back to back, then a pause. The median gap then lands
 inside a clump (≈1 ms) and describes the proxy's flushing, not the model: 1 ms
 ITL next to 138 tok/s is not a contradiction you should resolve by believing
 either. `tps` flags a request as **bursty** when its median gap is under 20% of
-its mean gap — a comparison of the stream with itself, so it needs no token
-counts. Bursty rows are marked `†`, never win "best ITL", carry a note, and are
+its typical gap (the mean with the longest 2% — at least two — left out, so a
+single stall isn't called a burst) — a comparison of the stream with itself, so
+it needs no token counts. Bursty rows are marked `†`, never win "best ITL", carry a note, and are
 counted in `bursty` (with `itl_n`, the number of requests the ITL median came
 from). No client-side measurement can recover the model's pacing from a
 coalesced stream.
@@ -102,8 +103,13 @@ table's concurrency. In `--json` results, top-level `ok`/`n`/`errors` count
 is the reliability signal — and `by_concurrency` breaks it down per level.
 
 Errors are classified (`rate_limited`, `timeout`, `http_<status>`, `transport`,
-`stream_error`, `empty_stream`) and counted in the Failures table. `stream_error`
-means the provider started streaming and then sent an error object mid-stream.
+`stream_error`, `incomplete_stream`, `content_filter`, `refusal`, `no_content`,
+`empty_stream`) and counted in the Failures table. `stream_error` means the
+provider started streaming and then sent an error object mid-stream;
+`incomplete_stream` is a Claude stream that ended without `message_stop` (cut
+off — its counts can't be trusted); `content_filter` / `refusal` are declines,
+never timed as answers; `no_content` is a billed response with nothing streamed
+that wasn't reasoning hitting the cap.
 
 There are no retries: a 429 at concurrency 16 is information.
 
