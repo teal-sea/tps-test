@@ -25,6 +25,8 @@ First public release.
 ### Fixed before release
 
 - A fingerprint target whose request failed was reported as a different artifact.
+- A noisy or unmeasured fingerprint target could bridge two distinguishable
+  groups and turn a `split` verdict into `consistent`.
 - `summary.csv` repeated the lowest-concurrency latency on every concurrency row.
 - `results[].ok/n` hid failures at higher concurrency; now counts every level.
 - A `mock` profile in a real config produced synthetic rows without `--mock`.

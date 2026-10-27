@@ -54,6 +54,11 @@ high (≥ 98% self-agreement) can move the verdict. Three kinds never do:
   the run used `--reps 1`. With `--reps 1` nobody has a floor, so the verdict is
   always `inconclusive`.
 
+Groups are formed from deterministic targets alone. A `noisy` or `unmeasured`
+target is then shown in the one group it matches; if it matches two, it gets a
+group of its own rather than merging them, so it can't turn a `split` into
+`consistent`.
+
 ![tps fingerprint output — demo data](assets/screenshot-fingerprint.svg)
 
 ## What it costs

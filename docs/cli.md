@@ -222,7 +222,8 @@ Latency and rate fields describe the lowest concurrency (`concurrency`);
 targets), `consistent`, or `inconclusive` (fewer than two targets with a
 measured, deterministic noise floor — always the case with `--reps 1`). Targets
 that errored are in `no_data` and never in `clusters`; `noisy` and `unmeasured`
-targets are clustered but never decide the verdict.
+targets are clustered but never decide the verdict — each joins the one group
+it matches, and never merges two.
 
 ### `doctor`
 

@@ -532,6 +532,41 @@ async def main() -> int:
             partial["verdict"] == "consistent" and partial["unmeasured"] == ["c"],
             f"{partial['verdict']} {partial['unmeasured']} {partial['clusters']}",
         )
+        # x and y differ at 2 of 100 tokens (98%: split at a perfect floor); u
+        # is 99% from each, so in one union-find it would bridge them
+        ref = [f"t{i}" for i in range(100)]
+        x_toks, y_toks, u_toks = ref, list(ref), list(ref)
+        y_toks[10], y_toks[20], u_toks[10] = "y10", "y20", "y10"
+        firm = [
+            core.Fingerprint(name, "p", rep, True, tokens=toks)
+            for name, toks in (("x", x_toks), ("y", y_toks))
+            for rep in (0, 1)
+        ]
+        u0 = core.Fingerprint("u", "p", 0, True, tokens=u_toks)
+        bridged = {
+            "unmeasured": [u0, core.Fingerprint("u", "p", 1, False, error="rate_limited: 429")],
+            "noisy": [u0, core.Fingerprint("u", "p", 1, True, tokens=u_toks[:50] + ref[:50])],
+        }
+        for kind, u_prints in bridged.items():
+            bridge = core.fingerprint_summary(firm + u_prints, ["x", "y", "u"], ["p"])
+            check(
+                f"{kind} target can't bridge two groups into consistent",
+                bridge["verdict"] == "split"
+                and bridge["distinguishable_groups"] == 2
+                and bridge["clusters"] == [["x"], ["y"], ["u"]]
+                and bridge[kind] == ["u"],
+                f"{bridge['verdict']} {bridge['clusters']}",
+            )
+        joined = core.fingerprint_summary(
+            same + [core.Fingerprint("u", "p", 0, True, tokens=a0.tokens)],
+            ["a", "b", "u"],
+            ["p"],
+        )
+        check(
+            "unmeasured target joins the one group it matches",
+            joined["verdict"] == "consistent" and joined["clusters"] == [["a", "b", "u"]],
+            f"{joined['verdict']} {joined['clusters']}",
+        )
 
         print("discover (offline fixture):")
         fixture = ROOT / "tests" / "fixtures" / "openrouter-endpoints.sample.json"

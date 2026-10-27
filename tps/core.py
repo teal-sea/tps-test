@@ -1773,15 +1773,59 @@ def cluster_targets(
 
     for i, a_name in enumerate(present):
         for b_name in present[i + 1 :]:
-            frac, _ = compare_prints(by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)])
-            floor = min(self_agree.get(a_name, 1.0), self_agree.get(b_name, 1.0))
-            if frac >= max(NOISE_FLOOR, floor - 0.01):
+            if _same_artifact(by_key, a_name, b_name, prompt, self_agree):
                 union(a_name, b_name)
 
     groups: dict[str, list[str]] = {}
     for target in present:
         groups.setdefault(find(target), []).append(target)
     return sorted(groups.values(), key=len, reverse=True)
+
+
+def _same_artifact(
+    by_key: dict[tuple[str, str, int], Fingerprint],
+    a_name: str,
+    b_name: str,
+    prompt: str,
+    self_agree: dict[str, float],
+) -> bool:
+    frac, _ = compare_prints(by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)])
+    floor = min(self_agree.get(a_name, 1.0), self_agree.get(b_name, 1.0))
+    return frac >= max(NOISE_FLOOR, floor - 0.01)
+
+
+def place_unweighed(
+    prints: list[Fingerprint],
+    targets: list[str],
+    firm_groups: list[list[str]],
+    unweighed: list[str],
+    prompt: str,
+    self_agree: dict[str, float],
+) -> list[list[str]]:
+    """Display clusters: the verdict's groups plus the targets it can't weigh.
+
+    An unweighed target joins the one firm group it matches. One that matches
+    several would bridge them, so it is grouped only with the other leftovers
+    and never merges two groups the verdict told apart.
+    """
+    by_key = {(f.target, f.prompt, f.rep): f for f in prints}
+    order = {t: i for i, t in enumerate(targets)}
+    groups = [list(g) for g in firm_groups]
+    loose = []
+    for target in unweighed:
+        hits = [
+            i
+            for i, firm in enumerate(firm_groups)
+            if any(_same_artifact(by_key, target, m, prompt, self_agree) for m in firm)
+        ]
+        if len(hits) == 1:
+            groups[hits[0]].append(target)
+        else:
+            loose.append(target)
+    placed = [sorted(g, key=order.__getitem__) for g in groups]
+    return sorted(placed, key=len, reverse=True) + cluster_targets(
+        prints, loose, prompt, self_agree
+    )
 
 
 def fingerprint_summary(
@@ -1804,8 +1848,12 @@ def fingerprint_summary(
     noisy = [t for t in present if t in self_agree and self_agree[t] < NOISE_FLOOR]
     unmeasured = [t for t in present if t not in self_agree]
     deterministic = [t for t in present if t in self_agree and self_agree[t] >= NOISE_FLOOR]
-    clusters = cluster_targets(prints, targets, prompt, self_agree)
-    firm_groups = [g for g in clusters if any(t in deterministic for t in g)]
+    # The verdict clusters deterministic targets alone: in one union-find, an
+    # unweighed target close to two of them (a~u, u~b, a≁b) would bridge
+    # their groups and turn a split into "consistent".
+    firm_groups = cluster_targets(prints, deterministic, prompt, self_agree)
+    unweighed = [t for t in present if t not in deterministic]
+    clusters = place_unweighed(prints, targets, firm_groups, unweighed, prompt, self_agree)
     if len(deterministic) < 2:
         verdict = "inconclusive"
     elif len(firm_groups) > 1:
