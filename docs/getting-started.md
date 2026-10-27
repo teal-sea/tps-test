@@ -5,8 +5,8 @@ Ten minutes from zero to a real comparison.
 ## 1. Install
 
 ```bash
-git clone https://github.com/teal-sea/tps-test
-cd tps-test
+git clone https://github.com/teal-sea/tpsbench
+cd tpsbench
 pipx install .
 ```
 

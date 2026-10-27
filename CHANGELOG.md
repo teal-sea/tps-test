@@ -35,4 +35,4 @@ First public release.
 - Input cost was dropped when a provider omitted `usage`.
 - Duplicate target names silently pooled their samples.
 
-[0.1.0]: https://github.com/teal-sea/tps-test
+[0.1.0]: https://github.com/teal-sea/tpsbench

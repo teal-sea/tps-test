@@ -3,14 +3,14 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tps-test"
+name = "tpsbench"
 version = "0.1.0"
 description = "Measure one model across many providers and gateways: TTFT, inter-token latency, throughput, cost, and whether they serve the same weights."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "teal-sea" }]
+authors = [{ name = "Thomas Lince" }]
 keywords = ["llm", "benchmark", "throughput", "latency", "providers", "gateways", "openrouter"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -34,9 +34,9 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
 assets = ["fonttools>=4.50", "uharfbuzz>=0.39"]
 
 [project.urls]
-Homepage = "https://github.com/teal-sea/tps-test"
-Documentation = "https://github.com/teal-sea/tps-test/tree/main/docs"
-Issues = "https://github.com/teal-sea/tps-test/issues"
+Homepage = "https://github.com/teal-sea/tpsbench"
+Documentation = "https://github.com/teal-sea/tpsbench/tree/main/docs"
+Issues = "https://github.com/teal-sea/tpsbench/issues"
 
 [project.scripts]
 tps = "tps.cli:main"

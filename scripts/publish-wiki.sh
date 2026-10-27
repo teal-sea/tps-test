@@ -6,7 +6,7 @@
 # never drift from the docs or the mkdocs site.
 #
 # Usage:
-#   scripts/publish-wiki.sh                    # defaults to teal-sea/tps-test
+#   scripts/publish-wiki.sh                    # defaults to teal-sea/tpsbench
 #   scripts/publish-wiki.sh owner/repo
 #   scripts/publish-wiki.sh --dry-run [DIR]    # build pages locally, push nothing
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS="$ROOT/docs"
-REPO="teal-sea/tps-test"
+REPO="teal-sea/tpsbench"
 DRY_RUN=""
 
 if [ "${1:-}" = "--dry-run" ]; then

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/teal-sea/tps-test/actions/workflows/selftest.yml"><img src="https://github.com/teal-sea/tps-test/actions/workflows/selftest.yml/badge.svg" alt="selftest"></a>
+  <a href="https://github.com/teal-sea/tpsbench/actions/workflows/selftest.yml"><img src="https://github.com/teal-sea/tpsbench/actions/workflows/selftest.yml/badge.svg" alt="selftest"></a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776ab?logo=python&logoColor=white" alt="Python 3.11 | 3.12 | 3.13">
   <img src="https://img.shields.io/badge/dependencies-1%20(httpx)-22d3ee" alt="1 dependency">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-a78bfa" alt="MIT license"></a>
@@ -40,7 +40,7 @@ row — then checks whether the cheap row is even the same artifact.
 ## Quick start
 
 ```bash
-git clone https://github.com/teal-sea/tps-test && cd tps-test
+git clone https://github.com/teal-sea/tpsbench && cd tpsbench
 pipx install .                          # gives you `tps`  (or: uv tool install . · python -m tps)
 
 tps run -c targets.mock.toml --mock     # see the whole pipeline offline, no key needed
@@ -184,4 +184,6 @@ python scripts/render_assets.py        # re-render README images from real CLI o
 - Numbers are from *your* network position: latency includes your RTT.
 - Speed, weights and quality are three questions; `tps` answers the first two.
 
-MIT licensed.
+## License
+
+MIT

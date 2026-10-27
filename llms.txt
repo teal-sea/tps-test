@@ -1,4 +1,4 @@
-# tps (repo: tps-test)
+# tpsbench
 
 > Measure one model across many providers and gateways: TTFT, inter-token
 > latency, throughput, cost, and whether they serve the same weights.

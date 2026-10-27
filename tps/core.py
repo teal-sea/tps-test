@@ -63,7 +63,7 @@ class ProviderError(TpsError):
 
 
 # identify benchmark traffic honestly to the providers being measured
-USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tps-test)"
+USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
 
 
 def redact(text: str, secret: str) -> str:

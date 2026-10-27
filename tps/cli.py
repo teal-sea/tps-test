@@ -880,7 +880,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  tps doctor\n"
             "  tps run -c targets.toml --reps 7 --concurrency 1,4\n"
             "  tps fingerprint -c targets.toml\n"
-            "\ndocs: https://github.com/teal-sea/tps-test/tree/main/docs"
+            "\ndocs: https://github.com/teal-sea/tpsbench/tree/main/docs"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -1,9 +1,9 @@
 site_name: tps
 site_description: Measure one model across many providers and gateways
-repo_url: https://github.com/teal-sea/tps-test
-repo_name: teal-sea/tps-test
+repo_url: https://github.com/teal-sea/tpsbench
+repo_name: teal-sea/tpsbench
 edit_uri: edit/main/docs/
-copyright: MIT licensed
+copyright: Copyright © 2026 Thomas Lince · MIT licensed
 
 theme:
   name: material

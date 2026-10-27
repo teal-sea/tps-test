@@ -31,8 +31,8 @@
 
 ## For agents
 
-[AGENTS.md](https://github.com/teal-sea/tps-test/blob/main/AGENTS.md) is the machine-oriented contract: commands, exit codes,
-JSON schema, invariants. [llms.txt](https://github.com/teal-sea/tps-test/blob/main/llms.txt) is the index for crawlers.
+[AGENTS.md](https://github.com/teal-sea/tpsbench/blob/main/AGENTS.md) is the machine-oriented contract: commands, exit codes,
+JSON schema, invariants. [llms.txt](https://github.com/teal-sea/tpsbench/blob/main/llms.txt) is the index for crawlers.
 
 ## The one-paragraph summary
 

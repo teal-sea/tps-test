@@ -6,7 +6,7 @@ retries, numbers you can defend. Changes that keep it that way are very welcome.
 ## Setup
 
 ```bash
-git clone https://github.com/teal-sea/tps-test && cd tps-test
+git clone https://github.com/teal-sea/tpsbench && cd tpsbench
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[http2,dev]"
 ```

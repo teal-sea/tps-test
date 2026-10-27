@@ -74,7 +74,7 @@ measuring the sun.
 
 ## Agent usage
 
-Give an agent [AGENTS.md](https://github.com/teal-sea/tps-test/blob/main/AGENTS.md) rather than the prose docs. The short
+Give an agent [AGENTS.md](https://github.com/teal-sea/tpsbench/blob/main/AGENTS.md) rather than the prose docs. The short
 version:
 
 1. `tps doctor --json` → if exit 2, ask the human for the missing env var; never
