@@ -29,8 +29,8 @@
 
 ## For agents
 
-[AGENTS.md](../AGENTS.md) is the machine-oriented contract: commands, exit codes,
-JSON schema, invariants. [llms.txt](../llms.txt) is the index for crawlers.
+[AGENTS.md](https://github.com/teal-sea/tps-test/blob/main/AGENTS.md) is the machine-oriented contract: commands, exit codes,
+JSON schema, invariants. [llms.txt](https://github.com/teal-sea/tps-test/blob/main/llms.txt) is the index for crawlers.
 
 ## The one-paragraph summary
 
@@ -44,7 +44,7 @@ fooling yourself.
 ## Wiki
 
 The same material is mirrored to the GitHub wiki for browsing. Source of truth is
-[`wiki/`](../wiki) in this repo; publish with:
+[`wiki/`](https://github.com/teal-sea/tps-test/tree/main/wiki) in this repo; publish with:
 
 ```bash
 scripts/publish-wiki.sh            # needs Settings -> Features -> Wikis enabled

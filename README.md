@@ -72,10 +72,16 @@ with synthetic numbers, instantly and offline.
 | [Troubleshooting](docs/troubleshooting.md) | the errors you will actually hit |
 | [FAQ](docs/faq.md) | short answers |
 
-**Wiki**: <https://github.com/teal-sea/tps-test/wiki> — the same material in
-browsable form. If the wiki is empty, enable *Settings → Features → Wikis* and run
-`scripts/publish-wiki.sh` (content lives in [`wiki/`](wiki/), so it's reviewable and
-versioned with the code).
+**Browsable docs site** (works offline, no plan needed):
+
+```bash
+pip install -e ".[docs]" && mkdocs serve   # http://127.0.0.1:8000
+```
+
+**GitHub wiki**: pages are written and versioned in [`wiki/`](wiki/), but GitHub
+only offers wikis on private repos for paid plans — see *Who can use this
+feature* in the [docs](https://docs.github.com/en/communities/documenting-your-project-with-wikis/about-wikis).
+Enable *Settings → Features → Wikis* (Pro/public), then `scripts/publish-wiki.sh`.
 
 Building an agent on top? Read [AGENTS.md](AGENTS.md) instead — it's the same
 contracts in a denser form.

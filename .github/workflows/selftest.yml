@@ -35,3 +35,14 @@ jobs:
           jq -e '.ok == true and (.results | length) == 3' run.json
           tps fingerprint -c targets.mock.toml --mock --reps 2 --prompt-count 1 --json > fp.json
           jq -e '.schema_version == 1 and (.clusters | length) >= 1' fp.json
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ".[docs]"
+      # --strict turns broken internal links into a build failure
+      - run: mkdocs build --strict
