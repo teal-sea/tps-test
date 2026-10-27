@@ -1,4 +1,4 @@
-# tps-test
+# tpsbench
 
 > Measure one model across many providers and gateways: TTFT, inter-token
 > latency, throughput, cost, and whether they serve the same weights.
@@ -19,12 +19,16 @@ CLI: `tps` (Python 3.11+, single dependency: httpx).
 - [docs/automation.md](docs/automation.md): CI, cron, JSON pipelines
 - [docs/troubleshooting.md](docs/troubleshooting.md)
 - [docs/faq.md](docs/faq.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md): dev setup and the invariants a change must keep
 
 ## Facts an assistant usually needs
 
-- Exit codes: 0 ok, 1 usage, 2 missing credentials, 3 provider failure, 4 all requests failed.
+- Exit codes: 0 ok, 1 usage (bad flags too), 2 missing credentials, 3 provider failure, 4 all requests failed, 130 interrupted (partial results kept).
 - Every command supports `--json` and prints one object with `schema_version: 1`.
 - Provider pins must use the full tag slug (`deepinfra/fp8/flex`); a base slug
   never matches a tier endpoint.
 - No retries by design; 429s/5xx are recorded as data.
-- `--mock` produces synthetic numbers and is flagged in the output.
+- `--mock` produces synthetic numbers and is flagged in the output; mock profiles are ignored without it.
+- p90 is always the slow tail (for tok/s, the 10th percentile).
+- `results[].ok/n` count every concurrency level; `by_concurrency` breaks them down.
+- `fingerprint --json` has a `verdict`; failed targets go to `no_data`, never to a cluster.

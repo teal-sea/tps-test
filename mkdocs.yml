@@ -1,27 +1,69 @@
-site_name: tps-test
+site_name: tps
 site_description: Measure one model across many providers and gateways
-repo_url: https://github.com/teal-sea/tps-test
+repo_url: https://github.com/teal-sea/tpsbench
+repo_name: teal-sea/tpsbench
 edit_uri: edit/main/docs/
+copyright: Copyright © 2026 Thomas Lince · MIT licensed
 
 theme:
-  name: readthedocs
-  navigation_depth: 2
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.highlight
+    - toc.follow
+
+extra_css:
+  - assets/extra.css
 
 markdown_extensions:
   - admonition
+  - attr_list
+  - md_in_html
   - tables
   - toc:
       permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
 
 nav:
   - Home: index.md
   - Getting started: getting-started.md
   - CLI reference: cli.md
   - Configuration: configuration.md
-  - Metrics: metrics.md
-  - Methodology: methodology.md
-  - Gateways: gateways.md
-  - Fingerprinting: fingerprinting.md
-  - Automation: automation.md
-  - Troubleshooting: troubleshooting.md
-  - FAQ: faq.md
+  - Concepts:
+      - Metrics: metrics.md
+      - Methodology: methodology.md
+      - Gateways: gateways.md
+      - Fingerprinting: fingerprinting.md
+  - Operations:
+      - Automation: automation.md
+      - Troubleshooting: troubleshooting.md
+      - FAQ: faq.md

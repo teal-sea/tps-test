@@ -36,11 +36,13 @@ api_key_env = "OPENROUTER_API_KEY"
 extra_body.provider = { only = ["together"], allow_fallbacks = false }
 ```
 
-`tps run -c targets.gateway.toml` then prints:
+`tps run -c targets.gateway.toml` then adds Δ columns to the table, measured
+against the baseline row:
 
 ```
-Δ vs together-direct:
-  together-via-or      +0.08s ttft   -6% tok/s
+│ provider          ttft   tok/s   …   Δ ttft  Δ tok/s │
+│ together-direct  0.34s    82.1   …     base     base │
+│ together-via-or  0.42s    77.2   …   +0.08s      -6% │
 ```
 
 That number is the hop. If it is ~0.05s, the gateway is a routing layer. If it is
@@ -74,7 +76,7 @@ api_key_env = "LITELLM_MASTER_KEY"
 extra_body.provider = { only = ["together"], allow_fallbacks = false }
 ```
 
-The rig does not care that it is on localhost; note in your writeup that the hop
+`tps` does not care that it is on localhost; note in your writeup that the hop
 is local (no WAN RTT), which makes it a *lower bound* on real gateway overhead.
 
 ## Things that look like gateway overhead but are not

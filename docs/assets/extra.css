@@ -1,0 +1,24 @@
+/* Palette matched to the banner: deep navy primary, cyan accent. */
+:root,
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #111a3a;
+  --md-primary-fg-color--light: #1e2a55;
+  --md-primary-fg-color--dark: #0b1022;
+  --md-accent-fg-color: #0891b2;
+  --md-typeset-a-color: #0e7490;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #0b1022;
+  --md-primary-fg-color--light: #1e2a55;
+  --md-primary-fg-color--dark: #070b18;
+  --md-accent-fg-color: #22d3ee;
+  --md-typeset-a-color: #67e8f9;
+  --md-default-bg-color: #0d1117;
+}
+
+/* screenshots and the banner scale with the column */
+.md-typeset img[src$=".svg"] {
+  max-width: 100%;
+  height: auto;
+}

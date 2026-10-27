@@ -2,27 +2,29 @@
 
 Exit codes are part of the contract (scripts and agents depend on them):
 
-    0  success
-    1  usage or configuration error
-    2  missing credentials
-    3  upstream/provider failure
-    4  run completed but every request failed
+    0    success
+    1    usage or configuration error (including bad flags)
+    2    missing credentials
+    3    upstream/provider failure
+    4    run completed but every request failed
+    130  interrupted (partial results are kept)
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
-import statistics
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__, core
-from .ui import UI, bar
+from .ui import UI, Bar, Col, Progress
 
 SCHEMA_VERSION = 1
 CONFIG_CANDIDATES = ("targets.toml", "targets.gateway.toml")
@@ -56,13 +58,27 @@ extra_body.provider = { only = ["example-provider"], allow_fallbacks = false }
 """
 
 
+class Interrupted(core.TpsError):
+    """Ctrl-C during a run; whatever finished is already on disk."""
+
+    exit_code = 130
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse exits 2 on bad usage, which would read as "missing credentials".
+    Raise a UsageError instead so bad flags exit 1 and honour --json."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        raise core.UsageError(f"{message} — see `{self.prog} --help`")
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
 
 def stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
 def resolve_config(path: Path | None) -> Path:
@@ -73,61 +89,92 @@ def resolve_config(path: Path | None) -> Path:
     for candidate in CONFIG_CANDIDATES:
         if Path(candidate).exists():
             return Path(candidate)
-    raise core.UsageError(
-        "no config found — run `tps init` to scaffold one, or pass -c <file>"
-    )
+    raise core.UsageError("no config found — run `tps init` to scaffold one, or pass -c <file>")
 
 
 def require_keys(cfg: core.RunConfig) -> None:
-    missing = [
-        t.name
-        for t in cfg.targets
-        if not t.key()
-        and "localhost" not in t.base_url
-        and "127.0.0.1" not in t.base_url
-    ]
+    missing = [t for t in cfg.targets if t.needs_key()]
     if missing:
-        envs = sorted({t.api_key_env for t in cfg.targets if t.name in missing and t.api_key_env})
+        envs = sorted({t.api_key_env for t in missing if t.api_key_env})
         raise core.MissingKeyError(
-            f"missing credentials for: {', '.join(missing)}"
+            f"missing credentials for: {', '.join(t.name for t in missing)}"
             + (f" — set {', '.join(envs)}" if envs else "")
             + " (or run with --mock)"
         )
 
 
+def check_mock(cfg: core.RunConfig, path: Path, mock: bool, ui: UI) -> None:
+    """`mock = {…}` profiles only ever apply under --mock."""
+    if mock:
+        return
+    profiled = [t.name for t in cfg.targets if t.mock is not None]
+    if profiled and len(profiled) == len(cfg.targets):
+        raise core.UsageError(
+            f"{path} only defines mock targets — add --mock for synthetic data, "
+            "or point -c at a real config"
+        )
+    if profiled:
+        ui.warn(f"ignoring mock profiles on {', '.join(profiled)} (they only apply with --mock)")
+
+
+def _int_list(text: str, flag: str) -> list[int]:
+    try:
+        return [int(c) for c in text.split(",") if c.strip()]
+    except ValueError:
+        raise core.UsageError(f"{flag} takes comma-separated integers, got {text!r}") from None
+
+
 def apply_overrides(cfg: core.RunConfig, args: argparse.Namespace) -> None:
     if getattr(args, "reps", None) is not None:
         cfg.reps = args.reps
-    if getattr(args, "concurrency", None):
-        cfg.concurrency = [int(c) for c in args.concurrency.split(",") if c]
-    if getattr(args, "prompts", None):
+    if getattr(args, "concurrency", None) is not None:
+        cfg.concurrency = _int_list(args.concurrency, "--concurrency")
+    if getattr(args, "prompts", None) is not None:
         wanted = [p.strip() for p in args.prompts.split(",") if p.strip()]
-        cfg.prompts = {
-            p: (cfg.prompts[p] if p in cfg.prompts else dict(core.DEFAULT_PROMPTS[p]))
-            for p in wanted
-        }
+        unknown = [p for p in wanted if p not in cfg.available_prompts]
+        if unknown:
+            raise core.UsageError(
+                f"unknown prompt(s) {unknown}; have {sorted(cfg.available_prompts)}"
+            )
+        cfg.prompts = {p: cfg.available_prompts[p] for p in wanted}
     if getattr(args, "no_warmup", False):
         cfg.warmup = 0
-    if getattr(args, "mock", False):
-        for target in cfg.targets:
-            if target.mock is None:
-                target.mock = {}
+    core.validate(cfg, "flags")
 
 
-def summarise(samples: list[core.Sample], meta: dict[str, Any]) -> dict[str, Any]:
-    """Structured result used by both --json and the terminal table."""
-    stats = core.summarize([s.as_dict() for s in samples])
-    per_stream = stats["per_stream"]
-    aggregate = stats["aggregate"]
+def _r(value: float | None, digits: int = 4) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    """Structured result used by --json and the terminal tables alike.
+
+    Latency/rate fields describe the lowest concurrency (`concurrency`); `ok`,
+    `n` and `errors` count every request at every level — the reliability
+    signal; `by_concurrency` breaks both down per level.
+    """
+    stats = core.summarize(samples)
+    buckets, per_stream, totals = stats["buckets"], stats["per_stream"], stats["totals"]
     prices = {t["name"]: t for t in meta.get("targets", [])}
+    order = {name: i for i, name in enumerate(prices)}
     rows: list[dict[str, Any]] = []
-    for (prompt, target), slot in sorted(per_stream.items()):
+    for prompt, target in sorted(per_stream, key=lambda k: (k[0], order.get(k[1], 1e9), k[1])):
         info = prices.get(target, {})
-        agg = {}
-        for (p, t, conc), bucket in aggregate.items():
-            if p != prompt or t != target or not bucket["batches"]:
+        st = core.bucket_stats(per_stream[(prompt, target)])
+        total = totals[(prompt, target)]
+        by_conc = {}
+        for (p, t, conc), bucket in sorted(buckets.items()):
+            if p != prompt or t != target:
                 continue
-            agg[str(conc)] = round(statistics.median(bucket["batches"]), 2)
+            level = core.bucket_stats(bucket)
+            by_conc[str(conc)] = {
+                "ttft_p50_s": _r(level["ttft_p50_s"]),
+                "out_tps_p50": _r(level["out_tps_p50"], 2),
+                "aggregate_tps": _r(level["aggregate_tps"], 2),
+                "ok": level["ok"],
+                "n": level["n"],
+                "errors": level["errors"],
+            }
         rows.append(
             {
                 "prompt": prompt,
@@ -135,19 +182,24 @@ def summarise(samples: list[core.Sample], meta: dict[str, Any]) -> dict[str, Any
                 "model": info.get("model"),
                 "base_url": info.get("base_url"),
                 "pin": info.get("pin"),
-                "ttft_p50_s": core.percentile(slot["ttft"], 0.5),
-                "ttft_p90_s": core.percentile(slot["ttft"], 0.9),
-                "out_tps_p50": core.percentile(slot["tps"], 0.5),
-                "out_tps_p90": core.percentile(slot["tps"], 0.9),
-                "itl_p50_ms": core.percentile(slot["itl"], 0.5),
-                "e2e_p50_s": core.percentile(slot["e2e"], 0.5),
-                "out_tokens_median": (
-                    statistics.median(slot["out"]) if slot["out"] else None
-                ),
-                "ok": slot["ok"],
-                "n": slot["n"],
-                "errors": slot["errors"],
-                "aggregate_tps": agg,
+                "concurrency": stats["min_conc"][prompt],
+                "ttft_p50_s": _r(st["ttft_p50_s"]),
+                "ttft_p90_s": _r(st["ttft_p90_s"]),
+                "first_content_p50_s": _r(st["first_content_p50_s"]),
+                "out_tps_p50": _r(st["out_tps_p50"], 2),
+                "out_tps_p90": _r(st["out_tps_p90"], 2),
+                "itl_p50_ms": _r(st["itl_p50_ms"], 2),
+                "e2e_p50_s": _r(st["e2e_p50_s"]),
+                "out_tokens_median": st["out_tokens_median"],
+                "ok": total["ok"],
+                "n": total["n"],
+                "errors": total["errors"],
+                "aggregate_tps": {
+                    c: v["aggregate_tps"] for c, v in by_conc.items() if v["aggregate_tps"]
+                },
+                "by_concurrency": by_conc,
+                "count_source": st["count_source"],
+                "served_by": st["served_by"],
                 "price_in_per_1m": info.get("price_in"),
                 "price_out_per_1m": info.get("price_out"),
             }
@@ -155,118 +207,301 @@ def summarise(samples: list[core.Sample], meta: dict[str, Any]) -> dict[str, Any
     return {"rows": rows, "baseline": meta.get("baseline")}
 
 
+# --------------------------------------------------------------------------
+# terminal rendering
+# --------------------------------------------------------------------------
+
+
+def _secs(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2f}s"
+
+
+def _ms(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0f}ms"
+
+
+def _best(rows: list[dict[str, Any]], key, lowest: bool) -> float | None:
+    values = [key(r) for r in rows if key(r) is not None]
+    if len(values) < 2:
+        return None
+    return min(values) if lowest else max(values)
+
+
 def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
-    rows = [
-        r for r in summary["rows"] if r["prompt"] == prompt and r["n"]
-    ]
-    if not rows:
+    rows = [r for r in summary["rows"] if r["prompt"] == prompt and r["n"]]
+    if not rows or ui.silent:
         return
+    conc = rows[0]["concurrency"]
+    level = str(conc)
     baseline = summary["baseline"]
     base = next((r for r in rows if r["target"] == baseline), None)
-    peak = max((r["out_tps_p50"] or 0) for r in rows) or 1
+    show_delta = bool(base and base["ttft_p50_s"] is not None and base["out_tps_p50"])
+    peak = max((r["out_tps_p50"] or 0 for r in rows), default=0)
 
-    headers = ["provider", "ttft", "tok/s", "spread", "itl", "ok", "$/1M out"]
-    cells = []
-    for row in rows:
-        cells.append(
-            [
-                row["target"],
-                core.fmt(row["ttft_p50_s"], 2) + "s",
-                core.fmt(row["out_tps_p50"], 1),
-                bar(row["out_tps_p50"], peak),
-                core.fmt(row["itl_p50_ms"], 0) + "ms",
-                f"{row['ok']}/{row['n']}",
-                core.fmt(row["price_out_per_1m"], 2),
-            ]
-        )
-    ui.say("")
-    ui.say(
-        ui.bold(f"{prompt} — single stream")
-        + ui.grey("   ttft = first token · tok/s = per-stream decode · itl = gap between chunks")
+    best_tps = _best(rows, lambda r: r["out_tps_p50"], lowest=False)
+    best_ttft = _best(rows, lambda r: r["ttft_p50_s"], lowest=True)
+    best_itl = _best(rows, lambda r: r["itl_p50_ms"], lowest=True)
+    cheapest = _best(rows, lambda r: r["price_out_per_1m"], lowest=True)
+
+    def mark(value, best):
+        return ui.best if best is not None and value == best else None
+
+    cols = [
+        Col("provider", "l"),
+        Col("ttft"),
+        Col("tok/s"),
+        Col("", "l", flex=True),
+        Col("itl", drop=1),
+        Col("ok"),
+        Col("$/1M out", drop=2),
+    ]
+    if show_delta:
+        cols += [Col("Δ ttft", drop=3), Col("Δ tok/s", drop=4)]
+
+    estimated = False
+    table = []
+    for r in rows:
+        est = "chars/4" in r["count_source"]
+        estimated |= est
+        ok, n = r["by_concurrency"][level]["ok"], r["by_concurrency"][level]["n"]
+        ok_style = ui.green if ok == n else ui.red if ok == 0 else ui.yellow
+        is_best = best_tps is not None and r["out_tps_p50"] == best_tps
+        cells: list[Any] = [
+            (r["target"], ui.bold if is_best else None),
+            (_secs(r["ttft_p50_s"]), mark(r["ttft_p50_s"], best_ttft)),
+            (("≈" if est else "") + core.fmt(r["out_tps_p50"]), mark(r["out_tps_p50"], best_tps)),
+            Bar(r["out_tps_p50"], peak, 24, ui.green if is_best else ui.cyan),
+            (_ms(r["itl_p50_ms"]), mark(r["itl_p50_ms"], best_itl)),
+            (f"{ok}/{n}", ok_style),
+            (core.fmt(r["price_out_per_1m"], 2), mark(r["price_out_per_1m"], cheapest)),
+        ]
+        if show_delta:
+            if r is base:
+                cells += [("base", ui.grey), ("base", ui.grey)]
+            else:
+                dt = r["ttft_p50_s"] - base["ttft_p50_s"] if r["ttft_p50_s"] is not None else None
+                ds = (
+                    (r["out_tps_p50"] - base["out_tps_p50"]) / base["out_tps_p50"] * 100
+                    if r["out_tps_p50"] is not None
+                    else None
+                )
+                cells += [
+                    ("—", None) if dt is None else (f"{dt:+.2f}s", ui.red if dt > 0 else ui.green),
+                    ("—", None) if ds is None else (f"{ds:+.0f}%", ui.red if ds < 0 else ui.green),
+                ]
+        table.append(cells)
+
+    title = f"{prompt} · single stream" if conc == 1 else f"{prompt} · c={conc}"
+    legend = "p50 · ttft first token · tok/s decode rate · itl gap between chunks"
+    if estimated:
+        legend += " · ≈ chars/4 estimate"
+    ui.say()
+    ui.table(cols, table, title=title, footer=legend)
+
+
+def print_load_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
+    rows = [r for r in summary["rows"] if r["prompt"] == prompt and r["n"]]
+    levels = sorted({int(c) for r in rows for c in r["by_concurrency"]})
+    if ui.silent or len(levels) < 2:
+        return
+    low, high = levels[0], levels[-1]
+    cols = (
+        [Col("provider", "l")] + [Col(f"c={c}") for c in levels] + [Col("scaling", "l"), Col("ok")]
     )
-    best = max(range(len(rows)), key=lambda i: rows[i]["out_tps_p50"] or 0)
-    ui.table(headers, cells, aligns=["l", "r", "r", "l", "r", "r", "r"], highlight=best)
-
-    if baseline and base:
-        ui.say("")
-        ui.say(ui.grey(f"Δ vs {baseline}:"))
-        for row in rows:
-            if row["target"] == baseline:
-                continue
-            dt = (row["ttft_p50_s"] or 0) - (base["ttft_p50_s"] or 0)
-            ds = (
-                ((row["out_tps_p50"] or 0) - (base["out_tps_p50"] or 0))
-                / (base["out_tps_p50"] or 1)
-                * 100
-            )
-            colour = ui.green if ds >= 0 else ui.red
-            ui.say(
-                f"  {row['target']:<24} {dt:+.2f}s ttft   "
-                + colour(f"{ds:+.0f}% tok/s")
-            )
+    peak = max(
+        (r["by_concurrency"].get(str(high), {}).get("aggregate_tps") or 0 for r in rows), default=0
+    )
+    table = []
+    for r in rows:
+        by = r["by_concurrency"]
+        cells: list[Any] = [r["target"]]
+        for c in levels:
+            agg = by.get(str(c), {}).get("aggregate_tps")
+            style = ui.best if c == high and agg and agg == peak and len(rows) > 1 else None
+            cells.append((core.fmt(agg), style))
+        lo_agg = by.get(str(low), {}).get("aggregate_tps")
+        hi_agg = by.get(str(high), {}).get("aggregate_tps")
+        if lo_agg and hi_agg:
+            ratio = hi_agg / lo_agg
+            efficiency = ratio / (high / low)
+            if efficiency >= 0.6:
+                cells.append((f"{ratio:.1f}× scales", ui.green))
+            elif efficiency < 0.35:
+                cells.append((f"{ratio:.1f}× queues", ui.yellow))
+            else:
+                cells.append((f"{ratio:.1f}× partial", None))
+        else:
+            cells.append(("—", None))
+        ok = sum(by[str(c)]["ok"] for c in levels[1:] if str(c) in by)
+        n = sum(by[str(c)]["n"] for c in levels[1:] if str(c) in by)
+        cells.append((f"{ok}/{n}", ui.green if ok == n else ui.red if ok == 0 else ui.yellow))
+        table.append(cells)
+    ui.say()
+    ui.table(
+        cols,
+        table,
+        title=f"{prompt} · under load · aggregate tok/s",
+        footer=f"all tokens in a batch ÷ its wall clock · scaling = c={high} vs c={low}",
+    )
 
 
 def print_rankings(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     rows = [r for r in summary["rows"] if r["prompt"] == prompt and r["ok"]]
-    if not rows:
+    if ui.silent or len(rows) < 2:
         return
-    fastest = max(rows, key=lambda r: r["out_tps_p50"] or 0)
-    snappiest = min(rows, key=lambda r: r["ttft_p50_s"] or 9e9)
-    priced = [r for r in rows if r["price_out_per_1m"]]
-    cheapest = min(priced, key=lambda r: r["price_out_per_1m"]) if priced else None
-    ui.say("")
-    ui.say(
-        f"  fastest  {ui.bold(fastest['target'])} "
-        f"({core.fmt(fastest['out_tps_p50'], 1)} tok/s)"
-    )
-    ui.say(
-        f"  snappiest {ui.bold(snappiest['target'])} "
-        f"({core.fmt(snappiest['ttft_p50_s'], 2)}s to first token)"
-    )
-    if cheapest:
-        ui.say(
-            f"  cheapest {ui.bold(cheapest['target'])} "
-            f"(${core.fmt(cheapest['price_out_per_1m'], 2)}/1M out)"
-        )
-
-
-def fingerprint_json(
-    prints: list[core.Fingerprint], targets: list[str], prompts: list[str]
-) -> dict[str, Any]:
-    self_agree = core.self_agreement_map(prints, targets, prompts)
-    clusters = core.cluster_targets(prints, targets, prompts[0], self_agree)
-    by_key = {(f.target, f.prompt, f.rep): f for f in prints}
-    pairs = []
-    for i, a_name in enumerate(targets):
-        for b_name in targets[i + 1:]:
-            a = by_key.get((a_name, prompts[0], 0))
-            b = by_key.get((b_name, prompts[0], 0))
-            if not a or not b or not a.ok or not b.ok:
-                continue
-            frac, first = core.compare_prints(a, b)
-            pairs.append(
-                {
-                    "a": a_name,
-                    "b": b_name,
-                    "agreement": round(frac, 4),
-                    "first_divergence": first,
-                }
+    lines = []
+    rated = [r for r in rows if r["out_tps_p50"] is not None]
+    if rated:
+        fastest = max(rated, key=lambda r: r["out_tps_p50"])
+        lines.append(("▲", "fastest", fastest["target"], f"{fastest['out_tps_p50']:.1f} tok/s"))
+    timed = [r for r in rows if r["ttft_p50_s"] is not None]
+    if timed:
+        snappiest = min(timed, key=lambda r: r["ttft_p50_s"])
+        lines.append(
+            (
+                "●",
+                "snappiest",
+                snappiest["target"],
+                f"{snappiest['ttft_p50_s']:.2f}s to first token",
             )
-    prompt_tokens = {
-        target: (
-            by_key[(target, prompts[0], 0)].prompt_tokens
-            if (target, prompts[0], 0) in by_key
-            else None
         )
-        for target in targets
-    }
-    return {
-        "self_agreement": {k: round(v, 4) for k, v in self_agree.items()},
-        "clusters": clusters,
-        "pairs": pairs,
-        "prompt_tokens": prompt_tokens,
-        "prompt_used": prompts[0],
-    }
+    priced = [r for r in rows if r["price_out_per_1m"] is not None]
+    if priced:
+        cheapest = min(priced, key=lambda r: r["price_out_per_1m"])
+        lines.append(
+            ("$", "cheapest", cheapest["target"], f"${cheapest['price_out_per_1m']:.2f} / 1M out")
+        )
+    width = max(len(name) for _i, _l, name, _d in lines)
+    ui.say()
+    for icon, label, name, detail in lines:
+        ui.say(
+            f"  {ui.cyan(icon)} {ui.grey(label.ljust(10))} {ui.bold(name.ljust(width))}  {detail}"
+        )
+
+
+def render_run(ui: UI, summary: dict[str, Any], prompts: list[str]) -> None:
+    for prompt in prompts:
+        print_run_table(ui, summary, prompt)
+        print_load_table(ui, summary, prompt)
+        print_rankings(ui, summary, prompt)
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, max(30, width), break_on_hyphens=False) or [""]
+
+
+def print_fingerprint(
+    ui: UI, summary: dict[str, Any], prints: list[core.Fingerprint], targets: list[str]
+) -> None:
+    if ui.silent:
+        return
+    by_key = {(f.target, f.prompt, f.rep): f for f in prints}
+    prompt = summary["prompt_used"]
+    present = [t for t in targets if t not in summary["no_data"]]
+    group_of = {t: i for i, g in enumerate(summary["clusters"]) for t in g}
+
+    if 2 <= len(present) <= 12:
+        letters = "ABCDEFGHIJKL"
+        name_w = min(26, max(len(t) for t in present))
+        label_w = name_w + 4
+        width = label_w + 5 * len(present) + 1
+        title = f" agreement · {prompt} · % identical tokens "
+        ui.say()
+        ui.say(ui.grey("╭─") + ui.bold(title) + ui.grey("─" * max(0, width - len(title) - 1) + "╮"))
+        head = " " * label_w + "".join(f"{letters[i]:>4} " for i in range(len(present)))
+        ui.say(ui.grey("│") + ui.dim(head.ljust(width)) + ui.grey("│"))
+        for i, a_name in enumerate(present):
+            label = f" {letters[i]}  {a_name[:name_w]:<{name_w}}"
+            cells = []
+            for b_name in present:
+                if a_name == b_name:
+                    cells.append(ui.heat(summary["self_agreement"].get(a_name), diagonal=True))
+                    continue
+                frac, _ = core.compare_prints(
+                    by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)]
+                )
+                cells.append(ui.heat(frac))
+            colour = ui.group(group_of.get(a_name, 0))
+            ui.say(ui.grey("│") + colour(label) + "".join(cells) + " " + ui.grey("│"))
+        swatch = lambda code, text: ui.style("■", code) + " " + ui.grey(text)  # noqa: E731
+        legend = "  ".join(
+            [
+                swatch("\033[38;5;28m", "≥99"),
+                swatch("\033[38;5;178m", "90–99"),
+                swatch("\033[38;5;130m", "50–90"),
+                swatch("\033[38;5;88m", "<50"),
+                swatch("\033[38;5;238m", "self"),
+            ]
+        )
+        plain = "■ ≥99  ■ 90–99  ■ 50–90  ■ <50  ■ self"
+        ui.say(ui.grey("├" + "─" * width + "┤"))
+        ui.say(ui.grey("│") + " " + legend + " " * max(0, width - len(plain) - 1) + ui.grey("│"))
+        ui.say(ui.grey("╰" + "─" * width + "╯"))
+
+    ui.say()
+    tokens = {}
+    for target, count in summary["prompt_tokens"].items():
+        if count is not None and target in present:
+            tokens.setdefault(count, []).append(target)
+    if len(tokens) > 1:
+        ui.warn(f"tokenizer: {len(tokens)} different prompt-token counts for the same input")
+        for count, names in sorted(tokens.items()):
+            for i, line in enumerate(_wrap(", ".join(names), ui.width - 20)):
+                ui.say(f"      {ui.grey(f'{count:>5} tok' if i == 0 else ' ' * 9)}  {line}")
+
+    noisy = set(summary["noisy"])
+    unweighed = noisy | set(summary["unmeasured"])
+    digits = len(str(max((len(g) for g in summary["clusters"]), default=1)))
+    for index, group in enumerate(summary["clusters"]):
+        colour = ui.group(index)
+        tag = (
+            " (no deterministic noise floor — can't be placed)"
+            if all(t in unweighed for t in group)
+            else ""
+        )
+        lines = _wrap(", ".join(group) + tag, ui.width - 22)
+        label = f"group {index + 1}"
+        count = ui.grey(f"({len(group):>{digits}})")
+        ui.say(f"  {colour('●')} {ui.bold(label)}  {count}  {lines[0]}")
+        for line in lines[1:]:
+            ui.say(" " * (17 + digits) + line)
+    for target, error in summary["no_data"].items():
+        ui.say(
+            f"  {ui.grey('○')} {ui.grey('no data')}  {target} {ui.grey('— ' + error.split(':')[0])}"
+        )
+    for target in summary["noisy"]:
+        value = summary["self_agreement"].get(target, 0)
+        ui.say(
+            f"  {ui.yellow('~')} {ui.grey('noisy')}    {target} {ui.grey(f'— self-agreement {value * 100:.0f}%')}"
+        )
+    if summary["noise_floor_measured"]:
+        for target in summary["unmeasured"]:
+            ui.say(
+                f"  {ui.yellow('?')} {ui.grey('no floor')} {target} {ui.grey('— second rep failed; not weighed')}"
+            )
+    else:
+        ui.warn("noise floor not measured — needs two successful reps per provider (--reps 2)")
+
+    ui.say()
+    verdict = summary["verdict"]
+    if verdict == "split":
+        firm = summary["distinguishable_groups"]
+        ui.say(
+            f"  {ui.badge('SPLIT', 'warn')} {firm} distinguishable groups — not the same artifact."
+        )
+        ui.hint("          Run a task eval before treating them as equivalent.")
+    elif verdict == "consistent":
+        ui.say(
+            f"  {ui.badge('CONSISTENT', 'ok')} indistinguishable at this resolution — "
+            "consistent with the same weights."
+        )
+    else:
+        ui.say(
+            f"  {ui.badge('INCONCLUSIVE', 'muted')} fewer than two providers with a measured, "
+            "deterministic noise floor."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +527,7 @@ def cmd_doctor(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     add(
         "http2",
         core.HTTP2,
-        "h2 installed" if core.HTTP2 else "optional — pip install \"httpx[http2]\"",
+        "h2 installed" if core.HTTP2 else 'optional — pip install "httpx[http2]"',
         critical=False,
     )
 
@@ -305,19 +540,30 @@ def cmd_doctor(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     except core.TpsError as exc:
         add("config", False, str(exc))
 
+    mock_only = bool(cfg and all(t.mock is not None for t in cfg.targets))
     if cfg:
-        missing = [t.name for t in cfg.targets if not t.key() and "localhost" not in t.base_url]
-        add(
-            "credentials",
-            not missing,
-            "all set" if not missing else f"missing for {len(missing)} target(s): {', '.join(missing[:4])}",
-        )
+        missing = [t for t in cfg.targets if t.needs_key()]
+        if mock_only:
+            detail = "not needed — mock-only config (use --mock)"
+        elif missing:
+            envs = sorted({t.api_key_env for t in missing if t.api_key_env})
+            detail = (
+                f"missing for {len(missing)} target(s): {', '.join(t.name for t in missing[:4])}"
+            )
+            detail += f"{' …' if len(missing) > 4 else ''}" + (
+                f" — set {', '.join(envs)}" if envs else ""
+            )
+        else:
+            detail = "all set"
+        add("credentials", mock_only or not missing, detail)
 
         if args.network and httpx is not None:
+
             async def probe() -> list[tuple[str, str]]:
-                timeout = httpx.Timeout(5.0)
-                out = []
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(5.0), follow_redirects=True
+                ) as client:
+
                     async def one(target: core.Target) -> tuple[str, str]:
                         try:
                             response = await client.get(target.base_url)
@@ -325,30 +571,38 @@ def cmd_doctor(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
                         except Exception as exc:  # noqa: BLE001 - report, never crash
                             return target.name, type(exc).__name__
 
-                    out = await asyncio.gather(*(one(t) for t in cfg.targets))
-                return out
+                    return await asyncio.gather(*(one(t) for t in cfg.targets))
 
             for name, detail in asyncio.run(probe()):
-                add(f"reach {name}", not detail.startswith(("Connect", "Timeout")), detail, critical=False)
+                # any HTTP status means the host answered; exceptions mean it didn't
+                add(f"reach {name}", detail.startswith("HTTP"), detail, critical=False)
 
-    ui.heading("Environment")
+    failed = [c for c in checks if c["critical"] and not c["ok"]]
+    if not failed:
+        exit_code = 0
+    elif all(c["check"] == "credentials" for c in failed):
+        exit_code = 2
+    else:
+        exit_code = 1
+
+    ui.header("doctor", "environment · config · credentials")
+    ui.say()
+    width = max(len(c["check"]) for c in checks) + 3
     for item in checks:
-        line = f"{item['check']}: {item['detail']}"
+        line = ui.kv(item["check"], item["detail"], width)
         if item["ok"]:
             ui.ok(line)
         elif item["critical"]:
             ui.fail(line)
         else:
             ui.warn(line)
-
-    ok = all(c["ok"] for c in checks if c.get("critical"))
-    if ok:
-        ui.say("")
-        ui.say(ui.green("Ready.") + ui.grey(" next: tps run -c targets.toml"))
+    ui.say()
+    if not failed:
+        run = f"tps run -c {config_path}" + (" --mock" if mock_only else "")
+        ui.say(f"  {ui.green(ui.bold('Ready.'))} {ui.grey('next →')} {run}")
     else:
-        ui.say("")
-        ui.say(ui.grey("Fix the ✗ rows above, then re-run `tps doctor`."))
-    return {"command": "doctor", "ok": ok, "checks": checks, "exit_code": 0 if ok else 2}
+        ui.say(ui.grey("  Fix the ✗ rows above, then re-run `tps doctor`."))
+    return {"command": "doctor", "ok": not failed, "checks": checks, "exit_code": exit_code}
 
 
 def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
@@ -356,15 +610,17 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     if out.exists() and not args.force:
         raise core.UsageError(f"{out} exists — pass --force to overwrite")
 
+    ui.header("init")
+    ui.say()
     if args.model:
         canonical, endpoints, _payload = core.fetch_endpoints(
             args.model, os.environ.get("OPENROUTER_API_KEY")
         )
         text, count, collapsed = core.targets_toml(canonical, endpoints)
         out.write_text(text, encoding="utf-8")
-        ui.ok(f"wrote {out} — {count} pinned targets for {canonical}")
-        note = f" ({collapsed} endpoint(s) collapsed)" if collapsed else ""
-        ui.hint(f"next: export OPENROUTER_API_KEY=... && tps run -c {out}{note}")
+        note = f" ({collapsed} duplicate endpoint(s) collapsed)" if collapsed else ""
+        ui.ok(f"wrote {ui.bold(str(out))} — {count} pinned targets for {canonical}{note}")
+        ui.hint(f"  next → export OPENROUTER_API_KEY=… && tps run -c {out}")
         return {
             "command": "init",
             "ok": True,
@@ -374,10 +630,15 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         }
 
     out.write_text(STARTER_CONFIG, encoding="utf-8")
-    ui.ok(f"wrote {out} (starter template)")
-    ui.hint("edit the targets, then: tps doctor && tps run -c " + str(out))
-    ui.hint("or generate for a real model: tps init --model deepseek/deepseek-v4.1-flash")
+    ui.ok(f"wrote {ui.bold(str(out))} (starter template)")
+    ui.hint(f"  next → edit the targets, then: tps doctor && tps run -c {out}")
+    ui.hint(
+        "  or generate one for a real model: tps init --model deepseek/deepseek-v4.1-flash --force"
+    )
     return {"command": "init", "ok": True, "config": str(out), "model": None, "targets": 0}
+
+
+QUANT_STYLE = {"fp4": "magenta", "fp6": "magenta", "fp8": "cyan", "bf16": "green", "fp16": "green"}
 
 
 def cmd_discover(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
@@ -388,21 +649,43 @@ def cmd_discover(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     if args.json_out:
         args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    ui.heading(f"{canonical} — {len(endpoints)} endpoints")
-    ui.table(
-        ["provider", "slug", "quant", "$/1M in", "$/1M out", "ctx"],
-        [
+    ui.header("discover", f"{canonical} · {len(endpoints)} endpoints")
+    shown = sorted(rows, key=lambda r: (r["price_out_per_1m"] is None, r["price_out_per_1m"] or 0))
+    peak = max((r["price_out_per_1m"] or 0 for r in rows), default=0)
+    cheapest = _best(rows, lambda r: r["price_out_per_1m"], lowest=True)
+    table = []
+    for row in shown:
+        quant = row["quantization"] or "—"
+        style = getattr(ui, QUANT_STYLE.get(str(quant).lower(), "grey"))
+        price_out = row["price_out_per_1m"]
+        table.append(
             [
                 row["provider"] or "—",
-                row["slug"],
-                row["quantization"] or "—",
+                (row["tag"] or row["slug"], ui.grey),
+                (quant, style),
                 core.fmt(row["price_in_per_1m"], 3),
-                core.fmt(row["price_out_per_1m"], 3),
+                (
+                    core.fmt(price_out, 3),
+                    ui.best if cheapest is not None and price_out == cheapest else None,
+                ),
+                Bar(price_out, peak, 16, ui.cyan),
                 f"{row['context_length'] // 1000}k" if row["context_length"] else "—",
             ]
-            for row in rows
+        )
+    ui.say()
+    ui.table(
+        [
+            Col("provider", "l"),
+            Col("pin", "l"),
+            Col("quant", "l"),
+            Col("$/1M in"),
+            Col("$/1M out"),
+            Col("", "l", flex=True),
+            Col("ctx", drop=1),
         ],
-        aligns=["l", "l", "l", "r", "r", "r"],
+        table,
+        title=f"{canonical} · sorted by output price",
+        footer="prices per 1M tokens from OpenRouter · quantization as reported by the provider",
     )
 
     written = None
@@ -411,11 +694,11 @@ def cmd_discover(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         text, count, collapsed = core.targets_toml(canonical, endpoints)
         args.out.write_text(text, encoding="utf-8")
         written = str(args.out)
-        ui.say("")
-        ui.ok(f"wrote {written} — {count} pinned targets")
+        ui.say()
+        ui.ok(f"wrote {ui.bold(written)} — {count} pinned targets")
         if collapsed:
-            ui.hint(f"{collapsed} duplicate endpoint(s) collapsed into the same pin")
-        ui.hint(f"next: tps run -c {written}")
+            ui.hint(f"  {collapsed} duplicate endpoint(s) collapsed into the same pin")
+        ui.hint(f"  next → tps run -c {written}")
     return {
         "command": "discover",
         "ok": True,
@@ -426,49 +709,80 @@ def cmd_discover(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     }
 
 
+def _n(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _models_label(cfg: core.RunConfig) -> str:
+    models = list(dict.fromkeys(t.model for t in cfg.targets))
+    return models[0] if len(models) == 1 else f"{len(models)} model ids"
+
+
 def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     path = resolve_config(args.config)
     cfg = core.load_config(path)
     apply_overrides(cfg, args)
+    check_mock(cfg, path, args.mock, ui)
     if not args.mock:
         require_keys(cfg)
 
     outdir = args.out or Path("runs") / stamp()
-    ui.heading(
-        f"{len(cfg.targets)} targets · {len(cfg.prompts)} prompt(s) · "
-        f"{cfg.reps} reps · concurrency {','.join(map(str, cfg.concurrency))}"
+    total = core.planned_requests(cfg)
+    ui.header("run", _models_label(cfg), mock=args.mock)
+    ui.hint(
+        f"  {_n(len(cfg.targets), 'target')} · {_n(len(cfg.prompts), 'prompt')} · {_n(cfg.reps, 'rep')} · "
+        f"concurrency {','.join(map(str, cfg.concurrency))} · {total} requests"
     )
-    if args.mock:
-        ui.warn("mock mode — synthetic numbers, no network")
+    if cfg.reps < 7:
+        ui.warn(f"{cfg.reps} reps — differences under ~15% are noise at this sample size")
 
-    def on_batch(**kw: Any) -> None:
-        ui.progress(
-            f"  {kw['target'][:26]:<26} c={kw['concurrency']:<3} rep={kw['rep']:<3} "
-            f"{kw['tps']:6.1f} tok/s  ok={kw['ok']}/{kw['total']}"
-        )
+    with Progress(ui, total, "warming up") as progress:
 
-    samples = asyncio.run(core.execute(cfg, outdir, args.mock, on_batch=on_batch))
-    ui.progress("", end=True)
+        def on_batch(**kw: Any) -> None:
+            if kw["phase"] == "warmup":
+                label = f"warm-up · {kw['target']}"
+            else:
+                label = f"{kw['target']} · c={kw['concurrency']} · rep {kw['rep'] + 1}/{cfg.reps}"
+            progress.update(kw["done"], label)
+
+        try:
+            samples = asyncio.run(core.execute(cfg, outdir, args.mock, on_batch=on_batch))
+        except KeyboardInterrupt:
+            progress.close()
+            kept = 0
+            try:
+                partial, meta = core.load_samples(outdir)
+                kept = sum(1 for s in partial if s.get("batch") != -1)
+                if kept:
+                    core.write_report(outdir, partial, meta)
+            except core.TpsError:
+                pass
+            raise Interrupted(
+                f"interrupted — {kept} measured request(s) kept in {outdir}"
+                + (f"; partial report at {outdir}/report.md" if kept else "")
+            ) from None
+
     meta = json.loads((outdir / "meta.json").read_text(encoding="utf-8"))
-    core.write_report(outdir, [s.as_dict() for s in samples], meta)
-    summary = summarise(samples, meta)
+    rows = [s.as_dict() for s in samples]
+    core.write_report(outdir, rows, meta)
+    summary = summarise(rows, meta)
+    render_run(ui, summary, list(cfg.prompts))
 
-    for prompt in cfg.prompts:
-        print_run_table(ui, summary, prompt)
-        print_rankings(ui, summary, prompt)
-
-    failed = sum(1 for s in samples if not s.ok)
+    measured = [s for s in samples if s.batch != -1]
+    failed = sum(1 for s in measured if not s.ok)
+    ui.say()
     if failed:
-        ui.say("")
-        ui.warn(f"{failed}/{len(samples)} requests failed — see the Failures section in the report")
-
-    ui.say("")
-    ui.ok(f"wrote {outdir}/report.md")
-    ui.hint(f"next: tps report {outdir}   ·   tps fingerprint -c {path}")
+        ui.warn(f"{failed}/{len(measured)} requests failed — see Failures in the report")
+    ui.ok(f"wrote {ui.bold(f'{outdir}/report.md')}  {ui.grey('· summary.csv · raw.jsonl')}")
+    ui.hint(
+        f"  next → tps report {outdir}   ·   tps fingerprint -c {path}"
+        + (" --mock" if args.mock else "")
+    )
 
     return {
         "command": "run",
-        "ok": failed < len(samples),
+        "ok": failed < len(measured),
+        "mock": args.mock,
         "run_dir": str(outdir),
         "config": str(path),
         "model": next((t["model"] for t in meta["targets"]), None),
@@ -476,9 +790,9 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "concurrency": cfg.concurrency,
         "results": summary["rows"],
         "failed": failed,
-        "total": len(samples),
+        "total": len(measured),
         # partial failure is data, not a usage error: it shows up in `failed`
-        "exit_code": 4 if samples and failed == len(samples) else 0,
+        "exit_code": 4 if measured and failed == len(measured) else 0,
         "artifacts": {
             "report": str(outdir / "report.md"),
             "csv": str(outdir / "summary.csv"),
@@ -490,62 +804,85 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
 def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     samples, meta = core.load_samples(args.run_dir)
     text = core.write_report(args.run_dir, samples, meta)
-    if not args.json:
-        print(text)
+    if args.markdown:
+        if not args.json:
+            print(text)
+        return {"command": "report", "ok": True, "run_dir": str(args.run_dir), "report": text}
+
+    flags = " · partial" if meta.get("complete") is False else ""
+    model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
+    ui.header(
+        "report",
+        f"{args.run_dir} · {model} · {meta.get('created', '?')}{flags}",
+        mock=bool(meta.get("mock")),
+    )
+    summary = summarise(samples, meta)
+    prompts = list(dict.fromkeys(r["prompt"] for r in summary["rows"]))
+    render_run(ui, summary, prompts)
+    ui.say()
+    ui.ok(f"rewrote {ui.bold(f'{args.run_dir}/report.md')}  {ui.grey('· summary.csv')}")
     return {"command": "report", "ok": True, "run_dir": str(args.run_dir), "report": text}
 
 
 def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     path = resolve_config(args.config)
     cfg = core.load_config(path)
+    for flag, value in (
+        ("--reps", args.reps),
+        ("--prompt-count", args.prompt_count),
+        ("--max-tokens", args.max_tokens),
+    ):
+        if value < 1:
+            raise core.UsageError(f"{flag} must be at least 1 (got {value})")
+    check_mock(cfg, path, args.mock, ui)
     if not args.mock:
         require_keys(cfg)
     outdir = args.out or Path("runs") / f"{stamp()}-fingerprint"
-    ui.heading(
-        f"fingerprinting {len(cfg.targets)} targets · {args.prompt_count} prompt(s)"
+    prompt_count = min(args.prompt_count, len(cfg.prompts))
+    total = prompt_count * args.reps * len(cfg.targets)
+    ui.header("fingerprint", _models_label(cfg), mock=args.mock)
+    ui.hint(
+        f"  {_n(len(cfg.targets), 'target')} · {_n(prompt_count, 'prompt')} · {_n(args.reps, 'rep')} · "
+        f"greedy, {args.max_tokens} tokens · {total} requests"
     )
 
-    def on_progress(**kw: Any) -> None:
-        ui.progress(f"  {kw['target'][:30]:<30} {kw['prompt'][:14]:<14} rep{kw['rep']}")
+    with Progress(ui, total) as progress:
+        try:
+            report, prints, summary = core.run_fingerprint(
+                cfg,
+                outdir,
+                args.max_tokens,
+                args.reps,
+                prompt_count,
+                args.mock,
+                on_progress=lambda **kw: progress.update(
+                    kw["done"], f"{kw['target']} · {kw['prompt']} · rep {kw['rep'] + 1}"
+                ),
+            )
+        except KeyboardInterrupt:
+            progress.close()
+            path = outdir / "fingerprints.jsonl"
+            kept = len(path.read_text().splitlines()) if path.exists() else 0
+            raise Interrupted(
+                f"interrupted — {kept} fingerprint(s) kept in {outdir}"
+                + (f"; partial report at {outdir}/fingerprint.md" if kept else "")
+            ) from None
 
-    report = core.run_fingerprint(
-        cfg,
-        outdir,
-        args.max_tokens,
-        args.reps,
-        args.prompt_count,
-        args.mock,
-        on_progress=on_progress,
-    )
-    ui.progress("", end=True)
-
-    prints = [core.Fingerprint(**row) for row in _read_prints(outdir)]
     targets = [t.name for t in cfg.targets]
-    prompt_names = list(cfg.prompts)[: args.prompt_count]
-    data = fingerprint_json(prints, targets, prompt_names)
+    print_fingerprint(ui, summary, prints, targets)
+    ui.say()
+    ui.ok(f"wrote {ui.bold(f'{outdir}/fingerprint.md')}  {ui.grey('· fingerprints.jsonl')}")
 
-    for index, group in enumerate(data["clusters"], start=1):
-        ui.say("")
-        ui.say(ui.bold(f"group {index}") + f"  ({len(group)})  " + ", ".join(group))
-    ui.say("")
-    if len(data["clusters"]) == 1:
-        ui.ok("indistinguishable at this resolution — consistent with the same weights")
-    else:
-        ui.warn("multiple groups — these are not the same artifact")
-    ui.hint(f"details: {outdir}/fingerprint.md")
-
+    any_ok = any(p.ok for p in prints)
     return {
         "command": "fingerprint",
-        "ok": True,
+        "ok": any_ok,
+        "mock": args.mock,
         "run_dir": str(outdir),
         "report": report,
-        **data,
+        **summary,
+        "exit_code": 0 if any_ok else 4,
     }
-
-
-def _read_prints(outdir: Path) -> list[dict[str, Any]]:
-    path = outdir / "fingerprints.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
 
 
 # --------------------------------------------------------------------------
@@ -554,19 +891,19 @@ def _read_prints(outdir: Path) -> list[dict[str, Any]]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    formatter = argparse.RawDescriptionHelpFormatter
-    parser = argparse.ArgumentParser(
+    parser = Parser(
         prog="tps",
         description="Measure one model across many providers and gateways.",
         epilog=(
             "examples:\n"
+            "  tps run -c targets.mock.toml --mock        # 2-second offline demo\n"
             "  tps init --model deepseek/deepseek-v4.1-flash\n"
             "  tps doctor\n"
             "  tps run -c targets.toml --reps 7 --concurrency 1,4\n"
             "  tps fingerprint -c targets.toml\n"
-            "\ndocs: https://github.com/teal-sea/tps-test/tree/main/docs"
+            "\ndocs: https://github.com/teal-sea/tpsbench/tree/main/docs"
         ),
-        formatter_class=formatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"tps {__version__}")
     parser.add_argument("--json", action="store_true", help="machine-readable output on stdout")
@@ -613,6 +950,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rep = sub.add_parser("report", help="re-render a previous run")
     p_rep.add_argument("run_dir", type=Path)
+    p_rep.add_argument("--markdown", action="store_true", help="print report.md instead of tables")
     common(p_rep)
 
     p_fp = sub.add_parser("fingerprint", help="test whether targets serve the same weights")
@@ -621,7 +959,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--max-tokens", type=int, default=160)
     p_fp.add_argument("--reps", type=int, default=2)
     p_fp.add_argument("--prompt-count", type=int, default=2, help="how many prompts to probe")
-    p_fp.add_argument("--mock", action="store_true")
+    p_fp.add_argument("--mock", action="store_true", help="synthetic fingerprints, no network")
     common(p_fp)
 
     return parser
@@ -637,10 +975,72 @@ COMMANDS = {
 }
 
 
+def _safe_streams() -> None:
+    """Never crash on a legacy console encoding: degrade glyphs instead."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
+def _error_payload(command: str | None, code: int, message: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "command": command,
+        "ok": False,
+        "error": {"code": code, "message": message},
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except BrokenPipeError:
+        # stdout closed early (`tps … | head`): stop quietly, like other CLIs
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 141
+
+
+def _main(argv: list[str] | None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    _safe_streams()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    want_json = "--json" in argv
+    command = next((a for a in argv if a in COMMANDS), None)
+    captured = io.StringIO()
+    try:
+        # in --json mode, --help/--version text is wrapped in the one JSON object
+        with contextlib.redirect_stdout(captured) if want_json else contextlib.nullcontext():
+            args = parser.parse_args(argv)
+    except core.UsageError as exc:
+        ui = UI(json_mode=want_json, color=False if "--no-color" in argv else None)
+        if want_json:
+            ui.emit(_error_payload(command, exc.exit_code, str(exc)))
+        else:
+            ui.error(str(exc))
+        return exc.exit_code
+    except SystemExit as exc:  # --help / --version
+        if want_json:
+            payload: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "command": command,
+                "ok": True,
+            }
+            if "--version" in argv:
+                payload["version"] = __version__
+            else:
+                payload["help"] = captured.getvalue()
+            UI(json_mode=True).emit(payload)
+        return int(exc.code or 0)
+
     if not args.command:
+        if args.json:
+            UI(json_mode=True).emit(_error_payload(None, 1, "no command given — see `tps --help`"))
+            return 1
         parser.print_help()
         return 0
 
@@ -657,37 +1057,26 @@ def main(argv: list[str] | None = None) -> int:
             ui.emit({"schema_version": SCHEMA_VERSION, **payload})
         return int(payload.get("exit_code", 0))
     except core.TpsError as exc:
-        code = exc.exit_code
         if args.json:
-            ui.emit(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "command": args.command,
-                    "ok": False,
-                    "error": {"code": code, "message": str(exc)},
-                }
-            )
+            ui.emit(_error_payload(args.command, exc.exit_code, str(exc)))
         else:
             ui.error(str(exc))
-        return code
+        return exc.exit_code
+    except BrokenPipeError:
+        raise
     except KeyboardInterrupt:
-        if not args.json:
+        if args.json:
+            ui.emit(_error_payload(args.command, 130, "interrupted"))
+        else:
             print("", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 - last resort, keep it readable
         if args.json:
-            ui.emit(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "command": args.command,
-                    "ok": False,
-                    "error": {"code": 1, "message": f"{type(exc).__name__}: {exc}"},
-                }
-            )
+            ui.emit(_error_payload(args.command, 1, f"{type(exc).__name__}: {exc}"))
         elif args.verbose:
             raise
         else:
-            ui.error(f"{type(exc).__name__}: {exc}")
+            ui.error(f"{type(exc).__name__}: {exc}", hint="re-run with -v for a traceback")
         return 1
 
 

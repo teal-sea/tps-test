@@ -7,11 +7,13 @@ command, stable exit codes, no interactive prompts.
 
 ```bash
 tps run -c targets.toml --json --reps 5 > run.json
-echo $?          # 0 ok · 1 usage · 2 credentials · 3 provider · 4 all failed
+echo $?          # 0 ok · 1 usage · 2 credentials · 3 provider · 4 all failed · 130 interrupted
 ```
 
 - stdout carries **only** the JSON object in `--json` mode.
-- errors are `<stdout JSON>` in `--json` mode, stderr text otherwise.
+- errors are `<stdout JSON>` in `--json` mode, stderr text otherwise — bad
+  flags included (they exit 1).
+- stderr stays empty in `--json` mode; there is no progress bar to scrape.
 - `schema_version` is 1 and only changes on breaking shapes.
 - `meta.json` in the run directory records everything needed to reproduce:
   model, pins, prices, reps, concurrency, `mock` flag.
@@ -32,7 +34,11 @@ tps discover deepseek/deepseek-v4.1-flash --json \
         | .[] | {provider, quantization, price_out_per_1m}'
 
 # did the fingerprint split the field?
-tps fingerprint -c targets.toml --json | jq -c '.clusters'
+tps fingerprint -c targets.toml --json | jq -r '.verdict, (.clusters | tostring)'
+
+# where did the 429s happen?
+tps run -c targets.toml --json --concurrency 1,16 \
+  | jq '.results[] | {target, c16: .by_concurrency["16"] | {ok, n, errors}}'
 ```
 
 ## CI: a performance regression gate
@@ -58,16 +64,17 @@ config is for humans.
 
 ```bash
 0 */6 * * * cd /srv/tps && /usr/local/bin/tps run -c targets.toml --json \
-  >> /var/log/tps/$(date +\%Y-\%m-\%d).jsonl
+  | jq -c . >> /var/log/tps/$(date +\%Y-\%m-\%d).jsonl
 ```
 
-Then diff `summary.csv` between runs, or load `raw.jsonl` into anything that reads
-JSON lines. Time of day is a variable — keep the schedule fixed or you are
+`--json` output is pretty-printed; `jq -c .` turns each run into one line so the
+log stays valid JSON Lines. Then diff `summary.csv` between runs, or load
+`raw.jsonl` into anything that reads JSON lines. Time of day is a variable — keep the schedule fixed or you are
 measuring the sun.
 
 ## Agent usage
 
-Give an agent [AGENTS.md](https://github.com/teal-sea/tps-test/blob/main/AGENTS.md) rather than the prose docs. The short
+Give an agent [AGENTS.md](https://github.com/teal-sea/tpsbench/blob/main/AGENTS.md) rather than the prose docs. The short
 version:
 
 1. `tps doctor --json` → if exit 2, ask the human for the missing env var; never
@@ -75,7 +82,7 @@ version:
 2. `tps discover <model> --json` → choose targets by policy (price, quant).
 3. `tps run --json` → read `results[]`, never scrape the table.
 4. `tps fingerprint --json` → refuse to present a cheap row as equivalent when
-   `clusters` has more than one group.
+   `verdict` is `split`; treat `no_data` targets as unverified, not different.
 
 Rules an agent must respect: no retries, no `--mock` numbers in a report, no
 conclusions below ~7 reps, and always include the date and your region.
@@ -102,6 +109,7 @@ case $code in
   0) echo "measured" ;;
   2) echo "no credentials; skipping" ; exit 0 ;;
   3|4) echo "provider problem; retry later" >&2 ; exit 1 ;;
+  130) echo "interrupted; partial results kept" >&2 ; exit 1 ;;
   *) echo "usage error" >&2 ; exit 1 ;;
 esac
 ```

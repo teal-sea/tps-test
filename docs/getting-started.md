@@ -5,8 +5,8 @@ Ten minutes from zero to a real comparison.
 ## 1. Install
 
 ```bash
-git clone https://github.com/teal-sea/tps-test
-cd tps-test
+git clone https://github.com/teal-sea/tpsbench
+cd tpsbench
 pipx install .
 ```
 
@@ -24,9 +24,15 @@ tps --version
 tps doctor
 ```
 
-`doctor` inspects Python, `httpx`, HTTP/2, your config, and credentials. Red rows
-are blocking; the ⚠ rows are optional. Add `--network` to also probe each
+`doctor` inspects Python, `httpx`, HTTP/2, your config, and credentials. ✗ rows
+are blocking; `!` rows are optional. Add `--network` to also probe each
 `base_url`.
+
+No key yet? See the whole pipeline offline first:
+
+```bash
+tps run -c targets.mock.toml --mock      # synthetic numbers, flagged MOCK DATA
+```
 
 ## 2. Get a provider list for your model
 
@@ -66,32 +72,26 @@ the target. OpenRouter is convenient because one key reaches every upstream.
 tps run -c targets.toml
 ```
 
-You get a table per prompt, plus rankings:
+A progress bar with an ETA runs while it measures; then you get a table per
+prompt, an under-load table if you configured more than one concurrency, and the
+rankings (shown here on the offline demo):
 
-```
-prose-256 — single stream   ttft = first token · tok/s = per-stream decode · itl = gap between chunks
-provider        ttft  tok/s  spread                     itl   ok  $/1M out
--------------  -----  -----  ------------------------  ----  ---  --------
-deepinfra       0.42s   78.3  ████████████████████████  12ms  7/7      0.42
-together        0.61s   51.9  ████████████████          18ms  7/7      1.20
+![tps run output — demo data](assets/screenshot-run.svg)
 
-  fastest  deepinfra (78.3 tok/s)
-  snappiest deepinfra (0.42s to first token)
-  cheapest deepinfra ($0.42/1M out)
-
-  ✓ wrote runs/2026-10-27T12-45-39Z/report.md
-```
+Best values are highlighted; `≈` marks a rate whose token count had to be
+estimated; `Δ` columns appear when the config names a `baseline`.
 
 Artifacts land in `runs/<timestamp>/`:
 
 | File | Contents |
 |---|---|
 | `report.md` | full tables, aggregate throughput, cost, failures |
-| `summary.csv` | one row per prompt × provider × concurrency |
-| `raw.jsonl` | every request; re-analyse without spending tokens |
-| `meta.json` | what was configured (model, pins, prices, mock flag) |
+| `summary.csv` | one row per prompt × provider × concurrency, each with its own stats |
+| `raw.jsonl` | every request, written as it lands; re-analyse without spending tokens |
+| `meta.json` | what was configured (model, pins, prices, mock flag, completion) |
 
-Re-render anytime: `tps report runs/2026-10-27T12-45-39Z`.
+Re-render anytime: `tps report runs/2026-10-27T12-45-39Z`. Interrupted with
+Ctrl-C? The finished requests are kept and the report is flagged `PARTIAL`.
 
 ## 5. Sanity-check the weights
 
@@ -101,16 +101,17 @@ Prices that look impossible usually mean fewer bits. Before trusting a cheap row
 tps fingerprint -c targets.toml
 ```
 
-Output groups providers by token-level agreement under greedy decoding. Different
-groups = different artifact (quantization, revision, or another model). See
-[fingerprinting](fingerprinting.md).
+Output groups providers by token-level agreement under greedy decoding and ends
+in a verdict. `split` = different artifacts (quantization, revision, or another
+model). Providers whose requests failed are listed as *no data*, never as
+different. See [fingerprinting](fingerprinting.md).
 
 ## Reading the numbers
 
 - **Compare `tok/s` at equal `ttft`.** A provider that returns one token instantly
   and then crawls is not fast.
 - **Check `ok`.** 6/7 means one failure; at concurrency 16, `ok` falling off is
-  rate limiting, not slowness.
+  rate limiting, not slowness — the under-load table shows it per level.
 - **Check `out tok`.** A provider that stops early looks fast. The report prints
   the median; compare it before comparing speed.
 - **Check your own noise first.** Two consecutive runs of the same config tell you

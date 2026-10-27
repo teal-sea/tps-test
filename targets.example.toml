@@ -1,11 +1,12 @@
-# Example rig config.
+# Example config: one model, reached three ways.
 #
 # One [[targets]] block = one upstream endpoint. To compare "the same model
-# across providers" you keep `model` identical and change base_url (direct
-# vendor) or the `provider.only` pin (gateway).
+# across providers", keep the *model* identical and change base_url (direct
+# vendor) or the `provider.only` pin (gateway). Every row below is meant to be
+# DeepSeek-V3.2; mixing versions turns a provider comparison into a model one.
 #
 # Generate the gateway blocks mechanically instead of typing them:
-#   python rig.py discover deepseek/deepseek-v3.2 --out targets.toml
+#   tps discover deepseek/deepseek-v3.2 --out targets.toml
 
 [run]
 reps = 7                # repetitions per (prompt, concurrency). 7 is a floor.
@@ -17,24 +18,26 @@ prompts = ["prose-256", "code-256"]
 # max_tokens_field = "max_tokens"   # use "max_completion_tokens" for o-series/GPT-5
 
 # --- direct vendor endpoints -------------------------------------------------
+# Vendors name the same weights differently. These ids are illustrative:
+# confirm the exact V3.2 id in each account before trusting a row.
 
 [[targets]]
 name = "deepseek-direct"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
+model = "deepseek-chat"            # DeepSeek's alias for its current V3.x release
 api_key_env = "DEEPSEEK_API_KEY"
 price = { in_per_1m = 0.28, out_per_1m = 0.42 }
 
 [[targets]]
 name = "together-direct"
 base_url = "https://api.together.xyz/v1"
-model = "deepseek-ai/DeepSeek-V3"
+model = "deepseek-ai/DeepSeek-V3.2"
 api_key_env = "TOGETHER_API_KEY"
 
 [[targets]]
 name = "fireworks-direct"
 base_url = "https://api.fireworks.ai/inference/v1"
-model = "accounts/fireworks/models/deepseek-v3"
+model = "accounts/fireworks/models/deepseek-v3p2"
 api_key_env = "FIREWORKS_API_KEY"
 
 # --- gateway, pinned to one upstream ----------------------------------------
@@ -60,11 +63,11 @@ extra_body.provider = { only = ["gmicloud"], allow_fallbacks = false, quantizati
 price = { in_per_1m = 0.2088, out_per_1m = 0.3096 }
 
 # --- the same gateway, left unpinned (for contrast) -------------------------
-# This row answers "what does the router actually give me by default".
+# No provider block: this row answers "what does the router give me by
+# default". Check `served by` in the report to see where requests landed.
 
 [[targets]]
 name = "or-unpinned"
 base_url = "https://openrouter.ai/api/v1"
 model = "deepseek/deepseek-v3.2"
 api_key_env = "OPENROUTER_API_KEY"
-extra_body.provider = { sort = "throughput" }

@@ -1,8 +1,7 @@
-"""Engine for tps-test: config, transport, metrics, reporting, discovery."""
+"""Engine for tps: config, transport, metrics, reporting, discovery, fingerprinting."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import csv
 import json
@@ -11,12 +10,16 @@ import statistics
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
+
+from . import __version__
 
 try:  # HTTP/2 is a nice-to-have; HTTP/1.1 is fine and universally supported
     import h2  # noqa: F401
@@ -24,7 +27,6 @@ try:  # HTTP/2 is a nice-to-have; HTTP/1.1 is fine and universally supported
     HTTP2 = True
 except ImportError:  # pragma: no cover
     HTTP2 = False
-
 
 
 # --------------------------------------------------------------------------
@@ -58,6 +60,28 @@ class ProviderError(TpsError):
     """Upstream/API failure while talking to a provider."""
 
     exit_code = 3
+
+
+# identify benchmark traffic honestly to the providers being measured
+USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
+
+
+SECRET_HEADER_HINTS = ("key", "token", "auth", "secret", "password")
+
+
+def redact(text: str, secrets: str | list[str]) -> str:
+    """Providers sometimes echo the submitted key in error bodies; never store it.
+
+    Redact the *full* text before truncating it, so a key that straddles the
+    cut can't leave its prefix behind."""
+    for secret in [secrets] if isinstance(secrets, str) else secrets:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 # --------------------------------------------------------------------------
@@ -107,15 +131,29 @@ DEFAULT_PROMPTS: dict[str, dict[str, Any]] = {
 
 
 def build_prompt(spec: dict[str, Any]) -> str:
-    """Turn a prompt spec into the string actually sent."""
+    """Turn a prompt spec into the string actually sent.
+
+    An explicit `document`/`document_file` is included once by default; the
+    built-in filler document is only used when `repeat` asks for it.
+    """
     text = spec.get("text", "")
     source = spec.get("document_file")
     if source:
-        doc = Path(source).expanduser().read_text(encoding="utf-8")
+        try:
+            doc = Path(source).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise UsageError(
+                f"prompt document_file not readable: {source} ({exc.strerror})"
+            ) from exc
+        default_repeat = 1
+    elif "document" in spec:
+        doc = str(spec["document"])
+        default_repeat = 1
     else:
-        doc = spec.get("document", PAD_DOC)
+        doc = PAD_DOC
+        default_repeat = 0
 
-    repeat = int(spec.get("repeat", 0) or 0)
+    repeat = int(spec.get("repeat", default_repeat) or 0)
     parts = [text] if text else []
     if repeat > 0:
         parts.append("\n\n".join([doc] * repeat))
@@ -131,6 +169,15 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------
 # config
 # --------------------------------------------------------------------------
+
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def is_local(url: str) -> bool:
+    try:
+        return (urlparse(url).hostname or "") in LOCAL_HOSTS
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -163,6 +210,19 @@ class Target:
                 return value
         return ""
 
+    def secrets(self) -> list[str]:
+        """The API key plus any credential-looking header values (x-api-key, …)."""
+        values = [self.key()]
+        for name, value in self.headers.items():
+            if isinstance(value, str) and any(h in name.lower() for h in SECRET_HEADER_HINTS):
+                values.append(value)
+                values.append(value.removeprefix("Bearer ").strip())
+        return [v for v in values if v]
+
+    def needs_key(self) -> bool:
+        """True when a real request would go out unauthenticated to a remote host."""
+        return not self.key() and not is_local(self.base_url)
+
     def note(self) -> str:
         pin = self.extra_body.get("provider")
         if isinstance(pin, dict):
@@ -184,11 +244,57 @@ class RunConfig:
     max_tokens_field: str = "max_tokens"
     stream_options: bool = True
     baseline: str | None = None
+    # every prompt that may be selected by name (built-ins + [prompts.*])
+    available_prompts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def validate(cfg: RunConfig, where: str = "config") -> None:
+    """Reject runs that would measure nothing or crash halfway through."""
+    if cfg.reps < 1:
+        raise UsageError(f"{where}: reps must be at least 1 (got {cfg.reps})")
+    if not cfg.concurrency or any(c < 1 for c in cfg.concurrency):
+        raise UsageError(
+            f"{where}: concurrency levels must be integers ≥ 1 (got {cfg.concurrency})"
+        )
+    if cfg.warmup < 0:
+        raise UsageError(f"{where}: warmup cannot be negative")
+    if cfg.timeout_s <= 0:
+        raise UsageError(f"{where}: timeout_s must be positive")
+    if not cfg.prompts:
+        raise UsageError(f"{where}: no prompts selected")
+    names = [t.name for t in cfg.targets]
+    if cfg.baseline and cfg.baseline not in names:
+        raise UsageError(
+            f"{where}: baseline {cfg.baseline!r} is not a target name; have {', '.join(names)}"
+        )
+
+
+def _table(entry: dict[str, Any], key: str, label: str, path: Path) -> dict[str, Any]:
+    value = entry.get(key) or {}
+    if not isinstance(value, dict):
+        raise UsageError(f"{path}: {label}: `{key}` must be a table, e.g. {key} = {{ … }}")
+    return value
+
+
+def _price(value: Any, key: str, label: str, path: Path) -> float | None:
+    """USD per 1M tokens; a quoted number is accepted, anything else is an error
+    now rather than a crash after every request has been sent."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise UsageError(f"{path}: {label}: `{key}` must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise UsageError(f"{path}: {label}: `{key}` must be a number, got {value!r}") from None
 
 
 def load_config(path: Path) -> RunConfig:
-    with open(path, "rb") as handle:
-        raw = tomllib.load(handle)
+    try:
+        with open(path, "rb") as handle:
+            raw = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise UsageError(f"{path}: invalid TOML — {exc}") from exc
 
     run = raw.get("run", {}) or {}
     target_dicts = raw.get("targets") or []
@@ -196,56 +302,77 @@ def load_config(path: Path) -> RunConfig:
         raise UsageError(f"{path}: no [[targets]] defined")
 
     targets: list[Target] = []
-    for entry in target_dicts:
-        price = entry.get("price", {}) or {}
+    for index, entry in enumerate(target_dicts, start=1):
+        label = entry.get("name") or f"target #{index}"
+        for key in ("base_url", "model"):
+            if not entry.get(key):
+                raise UsageError(f"{path}: {label} is missing `{key}`")
+        price = _table(entry, "price", label, path)
         targets.append(
             Target(
-                name=entry.get("name") or entry["model"],
+                name=str(entry.get("name") or entry["model"]),
                 base_url=entry["base_url"],
                 model=entry["model"],
                 api_key_env=entry.get("api_key_env"),
                 api_key=entry.get("api_key"),
-                headers=entry.get("headers", {}) or {},
-                extra_body=entry.get("extra_body", {}) or {},
-                price_in=price.get("in_per_1m"),
-                price_out=price.get("out_per_1m"),
+                headers=_table(entry, "headers", label, path),
+                extra_body=_table(entry, "extra_body", label, path),
+                price_in=_price(price.get("in_per_1m"), "price.in_per_1m", label, path),
+                price_out=_price(price.get("out_per_1m"), "price.out_per_1m", label, path),
                 max_tokens_field=entry.get("max_tokens_field"),
                 send_stream_options=bool(entry.get("stream_options", True)),
-                mock=entry.get("mock"),
+                mock=_table(entry, "mock", label, path) if "mock" in entry else None,
             )
         )
 
-    prompt_defs: dict[str, dict[str, Any]] = {}
+    names = [t.name for t in targets]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise UsageError(
+            f"{path}: duplicate target name(s): {', '.join(dupes)} — every statistic is "
+            "keyed by name, so give each target a unique `name`"
+        )
+
+    available = {name: dict(spec) for name, spec in DEFAULT_PROMPTS.items()}
     prompt_table = raw.get("prompts", {}) or {}
     for name, spec in prompt_table.items():
-        merged = dict(DEFAULT_PROMPTS.get(name, {}))
+        merged = dict(available.get(name, {}))
         merged.update(spec)
         merged.setdefault("max_tokens", 256)
-        prompt_defs[name] = merged
+        source = merged.get("document_file")
+        if source and not Path(source).expanduser().is_absolute():
+            # relative to the config file, so `-c elsewhere/targets.toml` works
+            merged["document_file"] = str((Path(path).parent / source).resolve())
+        available[name] = merged
 
-    selected = run.get("prompts") or list(prompt_defs) or list(DEFAULT_PROMPTS)[:2]
-    if not prompt_defs:
-        prompt_defs = {n: dict(DEFAULT_PROMPTS[n]) for n in selected}
-    missing = [n for n in selected if n not in prompt_defs]
+    selected = run.get("prompts") or list(prompt_table) or list(DEFAULT_PROMPTS)[:2]
+    if isinstance(selected, str):
+        selected = [selected]
+    missing = [n for n in selected if n not in available]
     if missing:
-        raise UsageError(f"unknown prompt(s): {missing}; have {sorted(prompt_defs)}")
+        raise UsageError(f"{path}: unknown prompt(s) {missing}; have {sorted(available)}")
 
-    conc = run.get("concurrency", [1])
-    if isinstance(conc, int):
-        conc = [conc]
-
-    return RunConfig(
-        targets=targets,
-        prompts={n: prompt_defs[n] for n in selected},
-        reps=int(run.get("reps", 7)),
-        concurrency=[int(c) for c in conc],
-        warmup=int(run.get("warmup", 2)),
-        timeout_s=float(run.get("timeout_s", 180)),
-        temperature=float(run.get("temperature", 0.0)),
-        max_tokens_field=run.get("max_tokens_field", "max_tokens"),
-        stream_options=bool(run.get("stream_options", True)),
-        baseline=run.get("baseline"),
-    )
+    try:
+        conc = run.get("concurrency", [1])
+        if isinstance(conc, int):
+            conc = [conc]
+        cfg = RunConfig(
+            targets=targets,
+            prompts={n: available[n] for n in selected},
+            reps=int(run.get("reps", 7)),
+            concurrency=[int(c) for c in conc],
+            warmup=int(run.get("warmup", 2)),
+            timeout_s=float(run.get("timeout_s", 180)),
+            temperature=float(run.get("temperature", 0.0)),
+            max_tokens_field=run.get("max_tokens_field", "max_tokens"),
+            stream_options=bool(run.get("stream_options", True)),
+            baseline=run.get("baseline"),
+            available_prompts=available,
+        )
+    except (TypeError, ValueError) as exc:
+        raise UsageError(f"{path}: [run] has a value of the wrong type — {exc}") from exc
+    validate(cfg, str(path))
+    return cfg
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +390,7 @@ class Sample:
     status: int | None = None
     error: str | None = None
     ttft_s: float | None = None
+    first_content_s: float | None = None
     e2e_s: float | None = None
     decode_s: float | None = None
     out_tokens: int | None = None
@@ -280,7 +408,7 @@ class Sample:
         return self.__dict__.copy()
 
 
-def percentile(values: list[float], q: float) -> float | None:
+def percentile(values: list[float | None], q: float) -> float | None:
     xs = sorted(v for v in values if v is not None)
     if not xs:
         return None
@@ -290,6 +418,25 @@ def percentile(values: list[float], q: float) -> float | None:
     lo = int(pos)
     hi = min(lo + 1, len(xs) - 1)
     return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def p50(values: list[float | None]) -> float | None:
+    return percentile(values, 0.5)
+
+
+def p90(values: list[float | None], higher_is_better: bool = False) -> float | None:
+    """The tail. For latencies that's the 90th percentile; for rates (where
+    higher is better) it's the 10th — the rate 90% of requests met or beat."""
+    return percentile(values, 0.1 if higher_is_better else 0.9)
+
+
+def median(values: list[float | None]) -> float | None:
+    xs = [v for v in values if v is not None]
+    return statistics.median(xs) if xs else None
+
+
+def _first_present(*values: Any) -> Any:
+    return next((v for v in values if v is not None), None)
 
 
 async def stream_once(
@@ -328,32 +475,33 @@ async def stream_once(
         concurrency=concurrency,
         batch=batch,
         ok=False,
-        wall_clock=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        wall_clock=now_iso(),
     )
 
     t0 = time.perf_counter()
     first = last = None
     gaps: list[float] = []
-    chars = 0
+    chars = 0  # content + reasoning: the chars/4 fallback and first-chunk share
+    first_chars = 0
     usage: dict[str, Any] | None = None
     served: str | None = None
+    stream_error: str | None = None
 
     try:
-        async with client.stream(
-            "POST", target.url(), json=body, headers=headers
-        ) as response:
+        async with client.stream("POST", target.url(), json=body, headers=headers) as response:
             sample.status = response.status_code
             if response.status_code >= 400:
                 raw = await response.aread()
-                snippet = raw[:600].decode("utf-8", "replace").strip()
+                snippet = redact(raw.decode("utf-8", "replace"), target.secrets())[:600].strip()
                 # Some OpenAI-compatible servers reject stream_options outright.
-                # That is a compatibility issue, not a performance result, so
-                # retry once without it rather than reporting a failed row.
+                # That is a compatibility issue, not a performance result: resend
+                # without it, and remember so later requests skip the doomed one.
                 if (
                     send_stream_options
                     and response.status_code in (400, 422)
                     and "stream_options" in snippet
                 ):
+                    target.send_stream_options = False
                     return await stream_once(
                         client,
                         target,
@@ -376,7 +524,7 @@ async def stream_once(
             )
 
             async for line in response.aiter_lines():
-                if not line or not line.startswith("data:"):
+                if not line.startswith("data:"):
                     continue
                 payload = line[5:].strip()
                 if payload == "[DONE]":
@@ -385,61 +533,84 @@ async def stream_once(
                     obj = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error"):
+                    # gateways report mid-stream upstream failures in-band
+                    err = obj["error"]
+                    message = err.get("message") if isinstance(err, dict) else err
+                    stream_error = redact(f"stream_error: {message}", target.secrets())[:300]
+                    break
                 if isinstance(obj.get("usage"), dict):
                     usage = obj["usage"]
                 if obj.get("provider") and not served:
                     served = str(obj["provider"])
                 choices = obj.get("choices") or []
-                if not choices:
+                if not choices or not isinstance(choices[0], dict):
                     continue
                 delta = choices[0].get("delta") or {}
                 piece = delta.get("content") or ""
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                piece = piece if isinstance(piece, str) else ""
+                reasoning = reasoning if isinstance(reasoning, str) else ""
                 if not piece and not reasoning:
                     continue
                 now = time.perf_counter()
+                size = len(piece) + len(reasoning)
                 if first is None:
                     first = now
+                    first_chars = size
                     sample.ttft_s = now - t0
-                elif piece:
-                    gaps.append(now - last if last is not None else 0.0)
+                elif piece and last is not None:
+                    gaps.append(now - last)
+                if piece and sample.first_content_s is None:
+                    sample.first_content_s = now - t0
                 last = now
                 sample.chunks += 1
-                chars += len(piece)
+                chars += size
 
     except httpx.TimeoutException:
         sample.error = "timeout"
         sample.e2e_s = time.perf_counter() - t0
         return sample
     except (httpx.HTTPError, OSError) as exc:
-        sample.error = f"transport: {type(exc).__name__}: {exc}"
+        sample.error = redact(f"transport: {type(exc).__name__}: {exc}", target.secrets())
         sample.e2e_s = time.perf_counter() - t0
         return sample
 
     sample.e2e_s = time.perf_counter() - t0
     sample.served_by = served
+    if stream_error:
+        sample.error = stream_error
+        return sample
 
+    estimated = False
     if usage:
-        sample.out_tokens = usage.get("completion_tokens") or usage.get(
-            "output_tokens"
+        sample.out_tokens = _first_present(
+            usage.get("completion_tokens"), usage.get("output_tokens")
         )
-        sample.in_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
-        sample.count_source = "usage"
-    if sample.out_tokens is None:
+        sample.in_tokens = _first_present(usage.get("prompt_tokens"), usage.get("input_tokens"))
+    if sample.out_tokens is None and chars:
         sample.out_tokens = max(1, round(chars / 4))
-        sample.count_source = "chars/4"
+        estimated = True
+    if sample.in_tokens is None:
+        # without it the cost columns would silently drop input spend
+        sample.in_tokens = estimate_tokens(prompt_text)
+        estimated = True
+    sample.count_source = "chars/4" if estimated else "usage"
 
-    if first is not None and last is not None and last > first:
+    if first is not None and last is not None and last > first and sample.out_tokens:
         sample.decode_s = last - first
-        if sample.out_tokens:
-            sample.out_tps = sample.out_tokens / sample.decode_s
+        # Tokens in the first chunk were generated before the window opened.
+        # Estimate them by that chunk's share of the text, so providers that
+        # send big chunks aren't credited with tokens they made "for free".
+        first_tokens = max(1.0, sample.out_tokens * first_chars / chars) if chars else 1.0
+        if sample.out_tokens > first_tokens:
+            sample.out_tps = (sample.out_tokens - first_tokens) / sample.decode_s
         if gaps:
             sample.itl_p50_ms = percentile(gaps, 0.5) * 1000
             sample.itl_p90_ms = percentile(gaps, 0.9) * 1000
-    elif first is not None and sample.e2e_s:
-        sample.decode_s = max(sample.e2e_s - sample.ttft_s, 1e-3)
-        if sample.out_tokens:
-            sample.out_tps = sample.out_tokens / sample.decode_s
+    # A single chunk has no decode window: the rate is unknown, not infinite.
 
     sample.ok = bool(sample.chunks and sample.out_tokens)
     if not sample.ok and not sample.error:
@@ -456,16 +627,17 @@ async def run_target_batch(
     cfg: RunConfig,
     concurrency: int,
     batch: int,
+    mock: bool = False,
 ) -> list[Sample]:
-    if target.mock is not None:
-        batch = [
-            mock_sample(target, prompt_name, concurrency, batch, max_tokens, i)
+    if mock:
+        samples = [
+            mock_sample(target, prompt_name, prompt_text, concurrency, batch, max_tokens, i)
             for i in range(concurrency)
         ]
-        wall = max(s.e2e_s or 0.0 for s in batch)
-        for sample in batch:
+        wall = max(s.e2e_s or 0.0 for s in samples)
+        for sample in samples:
             sample.batch_wall_s = wall
-        return batch
+        return samples
 
     async def one() -> Sample:
         return await stream_once(
@@ -485,12 +657,13 @@ async def run_target_batch(
     wall = time.perf_counter() - started
     for sample in samples:
         sample.batch_wall_s = wall
-    return samples
+    return list(samples)
 
 
 def mock_sample(
     target: Target,
     prompt_name: str,
+    prompt_text: str,
     concurrency: int,
     batch: int,
     max_tokens: int,
@@ -500,13 +673,16 @@ def mock_sample(
     import random
 
     prof = target.mock or {}
-    rng = random.Random(f"{target.name}:{prompt_name}:{batch}:{index}")
+    rng = random.Random(f"{target.name}:{prompt_name}:{concurrency}:{batch}:{index}")
     ttft = rng.uniform(*prof.get("ttft", (0.35, 0.8)))
     itl = rng.uniform(*prof.get("itl", (0.012, 0.028)))
     tokens = rng.randint(int(max_tokens * 0.85), max_tokens)
-    # concurrency degrades per-stream ITL, as real serving stacks do
-    itl *= 1 + 0.06 * (concurrency - 1)
-    decode = itl * tokens
+    # concurrency degrades per-stream ITL and queues the first token, as real
+    # serving stacks do; a lower `scaling` makes a provider that saturates early
+    scaling = float(prof.get("scaling", 0.94))
+    itl *= 1 + (1 - scaling) * (concurrency - 1)
+    ttft *= 1 + 0.04 * (concurrency - 1)
+    decode = itl * (tokens - 1)
     return Sample(
         target=target.name,
         prompt=prompt_name,
@@ -515,18 +691,19 @@ def mock_sample(
         ok=True,
         status=200,
         ttft_s=ttft,
+        first_content_s=ttft,
         e2e_s=ttft + decode,
         decode_s=decode,
         out_tokens=tokens,
-        in_tokens=estimate_tokens(DEFAULT_PROMPTS.get(prompt_name, {}).get("text", "")),
-        out_tps=tokens / decode,
+        in_tokens=estimate_tokens(prompt_text),
+        out_tps=(tokens - 1) / decode,
         itl_p50_ms=itl * 1000,
         itl_p90_ms=itl * 1000 * 1.4,
         chunks=tokens,
         count_source="mock",
         served_by=target.note() or "mock",
         batch_wall_s=ttft + decode,
-        wall_clock=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        wall_clock=now_iso(),
     )
 
 
@@ -542,77 +719,21 @@ def rotate(items: list[Any], n: int) -> list[Any]:
     return items[n:] + items[:n]
 
 
-async def execute(
-    cfg: RunConfig, outdir: Path, mock: bool, on_batch=None
-) -> list[Sample]:
-    samples: list[Sample] = []
-    started = time.time()
+def planned_requests(cfg: RunConfig) -> int:
+    """targets × prompts × reps × Σ(concurrency), plus warm-ups."""
+    measured = len(cfg.targets) * len(cfg.prompts) * cfg.reps * sum(cfg.concurrency)
+    return measured + len(cfg.targets) * cfg.warmup
 
-    limits = httpx.Limits(max_connections=256, max_keepalive_connections=64)
-    async with httpx.AsyncClient(
-        http2=HTTP2,
-        timeout=httpx.Timeout(cfg.timeout_s, connect=15.0),
-        limits=limits,
-        follow_redirects=True,
-    ) as client:
-        # warm-up: establish TLS/HTTP2, let the provider's cache settle
-        for target in cfg.targets:
-            for _ in range(cfg.warmup):
-                await run_target_batch(
-                    client,
-                    target,
-                    build_prompt(next(iter(cfg.prompts.values()))),
-                    next(iter(cfg.prompts)),
-                    int(next(iter(cfg.prompts.values())).get("max_tokens", 64)),
-                    cfg,
-                    1,
-                    -1,
-                )
 
-        for prompt_name, spec in cfg.prompts.items():
-            prompt_text = build_prompt(spec)
-            max_tokens = int(spec.get("max_tokens", 256))
-            for concurrency in cfg.concurrency:
-                for rep in range(cfg.reps):
-                    # rotate the order every rep so nobody always runs "first"
-                    for target in rotate(cfg.targets, rep):
-                        batch_samples = await run_target_batch(
-                            client,
-                            target,
-                            prompt_text,
-                            prompt_name,
-                            max_tokens,
-                            cfg,
-                            concurrency,
-                            rep,
-                        )
-                        samples.extend(batch_samples)
-                        ok = sum(1 for s in batch_samples if s.ok)
-                        rate = [
-                            s.out_tps for s in batch_samples if s.out_tps
-                        ]
-                        med = statistics.median(rate) if rate else 0.0
-                        if on_batch is not None:
-                            on_batch(
-                                elapsed=time.time() - started,
-                                prompt=prompt_name,
-                                concurrency=concurrency,
-                                rep=rep,
-                                target=target.name,
-                                ok=ok,
-                                total=concurrency,
-                                tps=med,
-                            )
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    with open(outdir / "raw.jsonl", "w", encoding="utf-8") as handle:
-        for sample in samples:
-            handle.write(json.dumps(sample.as_dict()) + "\n")
-    meta = {
-        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
+    return {
+        "created": now_iso(),
+        "tps_version": __version__,
         "mock": mock,
+        "complete": False,
         "reps": cfg.reps,
         "concurrency": cfg.concurrency,
+        "warmup": cfg.warmup,
         "temperature": cfg.temperature,
         "targets": [
             {
@@ -628,13 +749,113 @@ async def execute(
         "prompts": list(cfg.prompts),
         "baseline": cfg.baseline,
         "http2": HTTP2,
+        "planned_requests": planned_requests(cfg),
     }
-    (outdir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+async def execute(
+    cfg: RunConfig, outdir: Path, mock: bool, on_batch: Callable[..., None] | None = None
+) -> list[Sample]:
+    """Run every batch, interleaved, streaming results to disk as they land.
+
+    raw.jsonl is appended batch by batch and meta.json is written up front, so
+    an interrupted run keeps everything measured so far (`tps report` renders
+    it, flagged PARTIAL).
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    meta = run_meta(cfg, mock)
+    meta_path = outdir / "meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    samples: list[Sample] = []
+    total = planned_requests(cfg)
+    done = 0
+    limits = httpx.Limits(max_connections=256, max_keepalive_connections=64)
+    async with httpx.AsyncClient(
+        http2=HTTP2,
+        timeout=httpx.Timeout(cfg.timeout_s, connect=15.0),
+        limits=limits,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
+        with open(outdir / "raw.jsonl", "w", encoding="utf-8") as raw:
+
+            def record(batch_samples: list[Sample], **info: Any) -> None:
+                nonlocal done
+                for sample in batch_samples:
+                    raw.write(json.dumps(sample.as_dict()) + "\n")
+                raw.flush()
+                samples.extend(batch_samples)
+                done += len(batch_samples)
+                if on_batch is not None:
+                    rates = [s.out_tps for s in batch_samples if s.out_tps]
+                    on_batch(
+                        done=done,
+                        total=total,
+                        ok=sum(1 for s in batch_samples if s.ok),
+                        n=len(batch_samples),
+                        tps=statistics.median(rates) if rates else None,
+                        **info,
+                    )
+
+            # warm-up: establish TLS/HTTP2, let the provider's cache settle
+            warm_name, warm_spec = next(iter(cfg.prompts.items()))
+            warm_text = build_prompt(warm_spec)
+            for target in cfg.targets:
+                for _ in range(cfg.warmup):
+                    record(
+                        await run_target_batch(
+                            client,
+                            target,
+                            warm_text,
+                            warm_name,
+                            int(warm_spec.get("max_tokens", 64)),
+                            cfg,
+                            1,
+                            -1,
+                            mock,
+                        ),
+                        phase="warmup",
+                        target=target.name,
+                        prompt=warm_name,
+                        concurrency=1,
+                        rep=-1,
+                    )
+
+            for prompt_name, spec in cfg.prompts.items():
+                prompt_text = build_prompt(spec)
+                max_tokens = int(spec.get("max_tokens", 256))
+                for concurrency in cfg.concurrency:
+                    for rep in range(cfg.reps):
+                        # rotate the order every rep so nobody always runs "first"
+                        for target in rotate(cfg.targets, rep):
+                            record(
+                                await run_target_batch(
+                                    client,
+                                    target,
+                                    prompt_text,
+                                    prompt_name,
+                                    max_tokens,
+                                    cfg,
+                                    concurrency,
+                                    rep,
+                                    mock,
+                                ),
+                                phase="measure",
+                                target=target.name,
+                                prompt=prompt_name,
+                                concurrency=concurrency,
+                                rep=rep,
+                            )
+
+    meta["complete"] = True
+    meta["finished"] = now_iso()
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return samples
 
 
 # --------------------------------------------------------------------------
-# reporting
+# statistics
 # --------------------------------------------------------------------------
 
 
@@ -645,12 +866,143 @@ def load_samples(run_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             f"{run_dir} is not a tps run directory (no raw.jsonl) — "
             "pass the folder printed by `tps run`"
         )
-    samples = [
-        json.loads(line) for line in raw.read_text(encoding="utf-8").splitlines() if line
-    ]
+    samples = []
+    for line in raw.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            samples.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a run killed mid-write can leave one torn line
     meta_path = run_dir / "meta.json"
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    if not meta.get("targets"):
+        names = list(dict.fromkeys(s["target"] for s in samples))
+        meta["targets"] = [{"name": n} for n in names]
     return samples, meta
+
+
+def error_class(sample: dict[str, Any]) -> str:
+    return (sample.get("error") or "unknown").split(":")[0]
+
+
+def _bucket() -> dict[str, Any]:
+    return {
+        "ttft": [],
+        "first_content": [],
+        "e2e": [],
+        "tps": [],
+        "itl": [],
+        "in": [],
+        "out": [],
+        "batches": [],
+        "ok": 0,
+        "n": 0,
+        "errors": {},
+        "served": set(),
+        "count_source": set(),
+    }
+
+
+_FIELDS = (
+    ("ttft", "ttft_s"),
+    ("first_content", "first_content_s"),
+    ("e2e", "e2e_s"),
+    ("tps", "out_tps"),
+    ("itl", "itl_p50_ms"),
+    ("in", "in_tokens"),
+    ("out", "out_tokens"),
+)
+
+
+def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group measured samples by (prompt, target, concurrency).
+
+    `per_stream` is the bucket at the *lowest* concurrency configured for each
+    prompt (normally 1), because mixing c=1 and c=4 samples into one percentile
+    is how people accidentally invent a 30% regression that never happened.
+    `totals` counts every request for a (prompt, target), all concurrency
+    levels included — that is the reliability signal.
+    """
+    buckets: dict[tuple[str, str, int], dict[str, Any]] = {}
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    batch_tokens: dict[tuple, float] = {}
+    batch_wall: dict[tuple, float] = {}
+
+    for s in samples:
+        if s.get("batch") == -1:  # warm-up
+            continue
+        key = (s["prompt"], s["target"], s["concurrency"])
+        bucket = buckets.setdefault(key, _bucket())
+        total = totals.setdefault((s["prompt"], s["target"]), {"ok": 0, "n": 0, "errors": {}})
+        bucket["n"] += 1
+        total["n"] += 1
+        bkey = (*key, s["batch"])
+        batch_wall[bkey] = max(batch_wall.get(bkey, 0.0), s.get("batch_wall_s") or 0.0)
+        if s.get("ok"):
+            bucket["ok"] += 1
+            total["ok"] += 1
+            bucket["served"].add(s.get("served_by"))
+            bucket["count_source"].add(s.get("count_source"))
+            for name, source in _FIELDS:
+                bucket[name].append(s.get(source))
+            batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s.get("out_tokens") or 0)
+        else:
+            cls = error_class(s)
+            bucket["errors"][cls] = bucket["errors"].get(cls, 0) + 1
+            total["errors"][cls] = total["errors"].get(cls, 0) + 1
+
+    # aggregate throughput per batch: sum of tokens / wall clock of the batch
+    for bkey, tokens in batch_tokens.items():
+        wall = batch_wall.get(bkey) or 0.0
+        if wall > 0:
+            buckets[bkey[:3]]["batches"].append(tokens / wall)
+
+    min_conc: dict[str, int] = {}
+    for prompt, _target, conc in buckets:
+        min_conc[prompt] = min(min_conc.get(prompt, conc), conc)
+    per_stream = {(p, t): b for (p, t, c), b in buckets.items() if c == min_conc[p]}
+    return {"buckets": buckets, "per_stream": per_stream, "totals": totals, "min_conc": min_conc}
+
+
+def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
+    """The numbers every output (terminal, report, CSV, JSON) is built from."""
+    return {
+        "ttft_p50_s": p50(bucket["ttft"]),
+        "ttft_p90_s": p90(bucket["ttft"]),
+        "first_content_p50_s": p50(bucket["first_content"]),
+        "out_tps_p50": p50(bucket["tps"]),
+        "out_tps_p90": p90(bucket["tps"], higher_is_better=True),
+        "itl_p50_ms": p50(bucket["itl"]),
+        "e2e_p50_s": p50(bucket["e2e"]),
+        "out_tokens_median": median(bucket["out"]),
+        "in_tokens_median": median(bucket["in"]),
+        "aggregate_tps": median(bucket["batches"]),
+        "ok": bucket["ok"],
+        "n": bucket["n"],
+        "errors": dict(bucket["errors"]),
+        "count_source": sorted(x for x in bucket["count_source"] if x),
+        "served_by": sorted(x for x in bucket["served"] if x),
+    }
+
+
+def request_cost(
+    in_tokens: float | None,
+    out_tokens: float | None,
+    price_in: float | None,
+    price_out: float | None,
+) -> tuple[float | None, float | None]:
+    """(USD per 1k requests, USD per 1M generated tokens incl. their prompts)."""
+    if price_in is None or price_out is None or not out_tokens:
+        return None, None
+    per_request = ((in_tokens or 0) * price_in + out_tokens * price_out) / 1e6
+    return per_request * 1000, per_request * (1e6 / out_tokens)
+
+
+def fmt(value: float | None, digits: int = 1, scale: float = 1.0) -> str:
+    if value is None:
+        return "—"
+    return f"{value * scale:.{digits}f}"
 
 
 def bar(value: float, peak: float, width: int = 28) -> str:
@@ -660,294 +1012,227 @@ def bar(value: float, peak: float, width: int = 28) -> str:
     return "█" * filled
 
 
-def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    """Group by (prompt, target) and by (prompt, target, concurrency).
-
-    The latency table uses the *lowest* concurrency configured for each prompt
-    (normally 1), because mixing c=1 and c=4 samples into one percentile is how
-    people accidentally invent a 30% regression that never happened.
-    """
-    per_stream: dict[tuple[str, str], dict[str, Any]] = {}
-    aggregate: dict[tuple[str, str, int], dict[str, Any]] = {}
-    min_conc: dict[str, int] = {}
-
-    for s in samples:
-        if s["batch"] == -1:  # warm-up
-            continue
-        min_conc[s["prompt"]] = min(min_conc.get(s["prompt"], 10**6), s["concurrency"])
-
-    for s in samples:
-        if s["batch"] == -1:  # warm-up
-            continue
-        key = (s["prompt"], s["target"])
-        slot = per_stream.setdefault(
-            key,
-            {
-                "ttft": [],
-                "e2e": [],
-                "tps": [],
-                "itl": [],
-                "in": [],
-                "out": [],
-                "ok": 0,
-                "n": 0,
-                "conc": 1,
-                "errors": {},
-                "served": set(),
-                "count_source": set(),
-            },
-        )
-        if s["concurrency"] == min_conc[s["prompt"]]:
-            # only the lowest-concurrency samples feed the per-stream table
-            slot["n"] += 1
-            slot["conc"] = s["concurrency"]
-            slot["served"].add(s.get("served_by"))
-            slot["count_source"].add(s.get("count_source"))
-            if s["ok"]:
-                slot["ok"] += 1
-                slot["ttft"].append(s["ttft_s"])
-                slot["e2e"].append(s["e2e_s"])
-                slot["tps"].append(s["out_tps"])
-                slot["itl"].append(s["itl_p50_ms"])
-                slot["out"].append(s["out_tokens"])
-                slot["in"].append(s["in_tokens"])
-            else:
-                err = (s.get("error") or "unknown").split(":")[0]
-                slot["errors"][err] = slot["errors"].get(err, 0) + 1
-
-        bkey = (s["prompt"], s["target"], s["concurrency"])
-        agg = aggregate.setdefault(bkey, {"batches": [], "ok": 0, "n": 0, "errors": {}})
-        agg["n"] += 1
-        if s["ok"]:
-            agg["ok"] += 1
-        else:
-            err = (s.get("error") or "unknown").split(":")[0]
-            agg["errors"][err] = agg["errors"].get(err, 0) + 1
-
-    # aggregate throughput per batch (sum of tokens / wall clock of the batch)
-    batch_tokens: dict[tuple, float] = {}
-    for s in samples:
-        if s["batch"] == -1 or not s["ok"]:
-            continue
-        bkey = (s["prompt"], s["target"], s["concurrency"], s["batch"])
-        batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s["out_tokens"] or 0)
-    batch_wall: dict[tuple, float] = {}
-    for s in samples:
-        if s["batch"] == -1:
-            continue
-        bkey = (s["prompt"], s["target"], s["concurrency"], s["batch"])
-        batch_wall[bkey] = max(batch_wall.get(bkey, 0.0), s.get("batch_wall_s") or 0.0)
-
-    for bkey, tokens in batch_tokens.items():
-        prompt, target, conc, _ = bkey
-        wall = batch_wall.get(bkey) or 0.0
-        if wall > 0:
-            aggregate[(prompt, target, conc)]["batches"].append(tokens / wall)
-
-    return {"per_stream": per_stream, "aggregate": aggregate}
+# --------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------
 
 
-def fmt(value: float | None, digits: int = 1, scale: float = 1.0) -> str:
-    if value is None:
-        return "—"
-    return f"{value * scale:.{digits}f}"
+def _ordered_targets(meta: dict[str, Any], keys) -> list[str]:
+    names = [t["name"] for t in meta.get("targets", [])]
+    for key in keys:
+        if key not in names:
+            names.append(key)
+    return names
 
 
-def write_report(
-    run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, Any]
-) -> str:
+def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, Any]) -> str:
     stats = summarize(samples)
+    buckets = stats["buckets"]
     per_stream = stats["per_stream"]
-    aggregate = stats["aggregate"]
-    targets = [t["name"] for t in meta.get("targets", [])]
-    prompts = list(dict.fromkeys(p for (p, _t) in per_stream))
-    tag = " (MOCK DATA)" if meta.get("mock") else ""
+    min_conc = stats["min_conc"]
+    targets = _ordered_targets(meta, [t for (_p, t) in per_stream])
+    prompts = [p for p in dict.fromkeys([*(meta.get("prompts") or []), *min_conc]) if p in min_conc]
+    price_by_name = {t["name"]: t for t in meta.get("targets", [])}
 
-    lines: list[str] = []
-    lines.append(f"# Provider throughput rig — {run_dir.name}{tag}")
-    lines.append("")
-    model = next((t["model"] for t in meta.get("targets", [])), "?")
+    flags = []
+    if meta.get("mock"):
+        flags.append("MOCK DATA")
+    if meta.get("complete") is False:
+        flags.append("PARTIAL")
+    tag = f" ({', '.join(flags)})" if flags else ""
+
+    lines: list[str] = [f"# tps report — {run_dir.name}{tag}", ""]
+    if meta.get("mock"):
+        lines += [
+            "> **MOCK DATA** — synthetic numbers from `--mock`. Not a measurement; never publish them.",
+            "",
+        ]
+    if meta.get("complete") is False:
+        lines += [
+            "> **PARTIAL** — the run was interrupted; tables cover only the requests that finished.",
+            "",
+        ]
+    model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
     lines.append(
         f"- model: `{model}` · reps {meta.get('reps')} · "
         f"concurrency {meta.get('concurrency')} · temp {meta.get('temperature')} · "
         f"http2 {meta.get('http2')}"
     )
-    lines.append(f"- captured: {meta.get('created')}")
+    version = f" · tps {meta['tps_version']}" if meta.get("tps_version") else ""
+    lines.append(f"- captured: {meta.get('created')}{version}")
     lines.append("")
     lines.append(
-        "TTFT = time to first content token. ITL = gap between content chunks "
-        "(lower is smoother). tok/s = per-stream decode rate "
-        "(`completion_tokens / decode_window`). Aggregate = sum of tokens over "
-        "batch wall clock."
+        "TTFT = time to the first generated token (content or reasoning). "
+        "tok/s = per-stream decode rate across the streaming window. ITL = median gap "
+        "between content chunks. **p90 is always the slow tail** (for tok/s, the rate 90% "
+        "of requests met or beat). Aggregate = all tokens of a concurrent batch ÷ its wall "
+        "clock. Definitions: `docs/metrics.md`."
     )
     lines.append("")
 
+    estimated_any = False
     for prompt in prompts:
-        lines.append(f"## `{prompt}` — single stream")
+        conc = min_conc[prompt]
+        label = "single stream" if conc == 1 else f"lowest concurrency (c={conc})"
+        lines.append(f"## `{prompt}` — {label}")
         lines.append("")
-        rows = []
-        for target in targets:
-            slot = per_stream.get((prompt, target))
-            if not slot:
-                continue
-            rows.append((target, slot))
+        rows = [(t, per_stream[(prompt, t)]) for t in targets if (prompt, t) in per_stream]
 
-        # optional delta columns against a named baseline (usually the
-        # no-gateway direct endpoint): this is what turns "which is faster"
-        # into "what did the gateway hop cost me"
+        # Optional delta columns against a named baseline (usually the no-gateway
+        # direct endpoint): this turns "which is faster" into "what did the
+        # gateway hop cost me".
         base_name = meta.get("baseline")
-        base_slot = per_stream.get((prompt, base_name)) if base_name else None
-        base_ttft = percentile(base_slot["ttft"], 0.5) if base_slot else None
-        base_tps = percentile(base_slot["tps"], 0.5) if base_slot else None
-        show_delta = bool(base_slot and base_ttft and base_tps)
+        base = (
+            bucket_stats(per_stream[(prompt, base_name)])
+            if (prompt, base_name) in per_stream
+            else None
+        )
+        show_delta = bool(base and base["ttft_p50_s"] is not None and base["out_tps_p50"])
+        show_first = any(
+            fc is not None and tt is not None and fc - tt > 1e-6
+            for _t, b in rows
+            for fc, tt in zip(b["first_content"], b["ttft"], strict=False)
+        )
 
-        header = [
-            "provider", "TTFT p50", "TTFT p90", "out tok/s p50", "out tok/s p90",
-            "ITL p50 ms", "E2E p50", "out tok", "ok",
-        ]
+        header = ["provider", "TTFT p50", "TTFT p90"]
+        if show_first:
+            header.append("first answer p50")
+        header += ["tok/s p50", "tok/s p90", "ITL p50 ms", "E2E p50", "out tok", "ok"]
         if show_delta:
             header += [f"Δ TTFT vs {base_name}", f"Δ tok/s vs {base_name}"]
         lines.append("| " + " | ".join(header) + " |")
         lines.append("|" + "---|" * len(header))
 
-        for target, slot in rows:
-            ttft_p50 = percentile(slot["ttft"], 0.5)
-            tps_p50 = percentile(slot["tps"], 0.5)
-            cells = [
-                target,
-                fmt(ttft_p50, 2),
-                fmt(percentile(slot["ttft"], 0.9), 2),
-                fmt(tps_p50),
-                fmt(percentile(slot["tps"], 0.9)),
-                fmt(percentile(slot["itl"], 0.5)),
-                fmt(percentile(slot["e2e"], 0.5), 2),
-                fmt(statistics.median(slot["out"]) if slot["out"] else None, 0),
-                f"{slot['ok']}/{slot['n']}",
+        for target, bucket in rows:
+            st = bucket_stats(bucket)
+            estimated = "chars/4" in st["count_source"]
+            estimated_any |= estimated
+            mark = " ≈" if estimated else ""
+            cells = [target, fmt(st["ttft_p50_s"], 2), fmt(st["ttft_p90_s"], 2)]
+            if show_first:
+                cells.append(fmt(st["first_content_p50_s"], 2))
+            cells += [
+                fmt(st["out_tps_p50"]) + mark,
+                fmt(st["out_tps_p90"]) + mark,
+                fmt(st["itl_p50_ms"]),
+                fmt(st["e2e_p50_s"], 2),
+                fmt(st["out_tokens_median"], 0),
+                f"{st['ok']}/{st['n']}",
             ]
             if show_delta:
                 if target == base_name:
                     cells += ["—", "—"]
                 else:
-                    d_ttft = (ttft_p50 - base_ttft) if ttft_p50 is not None else None
+                    d_ttft = (
+                        st["ttft_p50_s"] - base["ttft_p50_s"]
+                        if st["ttft_p50_s"] is not None
+                        else None
+                    )
                     d_tps = (
-                        (tps_p50 - base_tps) / base_tps * 100
-                        if tps_p50 is not None
+                        (st["out_tps_p50"] - base["out_tps_p50"]) / base["out_tps_p50"] * 100
+                        if st["out_tps_p50"] is not None
                         else None
                     )
                     cells += [
-                        "—" if d_ttft is None else f"{d_ttft:+.2f}",
+                        "—" if d_ttft is None else f"{d_ttft:+.2f}s",
                         "—" if d_tps is None else f"{d_tps:+.0f}%",
                     ]
             lines.append("| " + " | ".join(str(c) for c in cells) + " |")
         lines.append("")
 
-        peak = max(
-            (
-                percentile(per_stream[(prompt, t)]["tps"], 0.5) or 0
-                for t in targets
-                if (prompt, t) in per_stream
-            ),
-            default=0.0,
-        )
+        peak = max((p50(b["tps"]) or 0 for _t, b in rows), default=0.0)
         lines.append("```")
-        for target in targets:
-            slot = per_stream.get((prompt, target))
-            if not slot:
-                continue
-            p50 = percentile(slot["tps"], 0.5) or 0
+        width = max((len(t) for t, _b in rows), default=10)
+        for target, bucket in rows:
+            rate = p50(bucket["tps"])
             extra = ""
-            if slot["errors"]:
-                extra = "  " + " ".join(f"[{k}×{v}]" for k, v in slot["errors"].items())
-            lines.append(f"{target:<24} {bar(p50, peak)} {p50:7.1f} tok/s{extra}")
+            if bucket["errors"]:
+                extra = "  " + " ".join(f"[{k}×{v}]" for k, v in bucket["errors"].items())
+            shown = "      — tok/s" if rate is None else f"{rate:7.1f} tok/s"
+            lines.append(f"{target:<{width}}  {bar(rate or 0, peak):<28} {shown}{extra}")
         lines.append("```")
         lines.append("")
 
-        concs = sorted(
-            {c for (p, _t, c) in aggregate if p == prompt}, reverse=False
-        )
-        if len(concs) > 1 or (concs and concs[0] != 1):
-            lines.append(f"## `{prompt}` — aggregate throughput (tokens/sec)")
+        concs = sorted({c for (p, _t, c) in buckets if p == prompt})
+        if len(concs) > 1 or concs[0] != 1:
+            lines.append(f"## `{prompt}` — under load")
             lines.append("")
-            header = "| provider | " + " | ".join(f"c={c}" for c in concs) + " |"
-            lines.append(header)
-            lines.append("|---" * (len(concs) + 1) + "|")
+            lines.append(
+                "| provider | c | aggregate tok/s | vs c="
+                + str(concs[0])
+                + " | per-stream tok/s p50 "
+                "| TTFT p50 | ok | errors |"
+            )
+            lines.append("|---|---|---|---|---|---|---|---|")
             for target in targets:
-                cells = []
+                first_agg = None
                 for c in concs:
-                    agg = aggregate.get((prompt, target, c))
-                    val = statistics.median(agg["batches"]) if agg and agg["batches"] else None
-                    cells.append(fmt(val))
-                lines.append(f"| {target} | " + " | ".join(cells) + " |")
+                    bucket = buckets.get((prompt, target, c))
+                    if not bucket:
+                        continue
+                    st = bucket_stats(bucket)
+                    agg = st["aggregate_tps"]
+                    if c == concs[0]:
+                        first_agg = agg
+                    scale = f"{agg / first_agg:.1f}×" if agg and first_agg else "—"
+                    errors = ", ".join(f"{k} × {v}" for k, v in sorted(st["errors"].items()))
+                    lines.append(
+                        f"| {target} | {c} | {fmt(agg)} | {scale} | {fmt(st['out_tps_p50'])} | "
+                        f"{fmt(st['ttft_p50_s'], 2)} | {st['ok']}/{st['n']} | {errors or '—'} |"
+                    )
             lines.append("")
+            lines.append(
+                "Aggregate rising roughly with `c` means the provider scales; flat aggregate "
+                "with collapsing per-stream tok/s means it queues."
+            )
+            lines.append("")
+
+    if estimated_any:
+        lines.append(
+            "> ≈ token counts were estimated as chars/4 because the provider sent no "
+            "`usage` block. Treat those rates as approximate."
+        )
+        lines.append("")
 
     # cost + provenance
     lines.append("## Cost & provenance")
     lines.append("")
     lines.append(
-        "| provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens | served by | token source |"
+        "| provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens "
+        "| served by | token source |"
     )
     lines.append("|---|---|---|---|---|---|---|")
-    price_by_name = {t["name"]: t for t in meta.get("targets", [])}
     for target in targets:
         info = price_by_name.get(target, {})
         pin = info.get("pin") or {}
-        served = set()
-        source = set()
-        cost_per_1k = None
-        cost_per_mtok = None
-        for (p, t), slot in per_stream.items():
-            if t != target:
-                continue
-            served |= {x for x in slot["served"] if x}
-            source |= {x for x in slot["count_source"] if x}
-        median_in = statistics.median(
-            [
-                v
-                for (_p, t), s in per_stream.items()
-                if t == target
-                for v in s["in"]
-                if v is not None
-            ]
-            or [0]
+        pooled = [b for (_p, t), b in per_stream.items() if t == target]
+        served = sorted({x for b in pooled for x in b["served"] if x})
+        source = sorted({x for b in pooled for x in b["count_source"] if x})
+        median_in = median([v for b in pooled for v in b["in"]])
+        median_out = median([v for b in pooled for v in b["out"]])
+        per_1k, per_mtok = request_cost(
+            median_in, median_out, info.get("price_in"), info.get("price_out")
         )
-        median_out = statistics.median(
-            [
-                v
-                for (_p, t), s in per_stream.items()
-                if t == target
-                for v in s["out"]
-                if v is not None
-            ]
-            or [0]
-        )
-        if info.get("price_in") is not None and info.get("price_out") is not None:
-            per_request = (
-                median_in * info["price_in"] + median_out * info["price_out"]
-            ) / 1e6
-            cost_per_1k = per_request * 1000
-            # fully-loaded cost of a million output tokens, incl. its prompt
-            if median_out:
-                cost_per_mtok = per_request * (1e6 / median_out)
+        pinned = ",".join(pin.get("only", [])) if isinstance(pin, dict) else ""
         lines.append(
             "| {} | {} | {} | {} | {} | {} | {} |".format(
                 target,
                 fmt(info.get("price_in"), 3),
                 fmt(info.get("price_out"), 3),
-                fmt(cost_per_1k, 3),
-                fmt(cost_per_mtok, 2),
-                ", ".join(sorted(served))
-                or ("pin:" + ",".join(pin.get("only", [])) if pin else "—"),
-                ", ".join(sorted(source)),
+                fmt(per_1k, 3),
+                fmt(per_mtok, 2),
+                ", ".join(served) or (f"pin:{pinned}" if pinned else "—"),
+                ", ".join(source) or "—",
             )
         )
     lines.append("")
     lines.append(
-        "> Provider attribution comes from the response (`provider` field or "
-        "`x-openrouter-provider` header) when the gateway exposes it. If that "
-        "column is empty you were routed by a gateway, not pinned to an upstream."
+        "> Cost uses the median request across all prompts. Provider attribution comes from "
+        "the response (`provider` field or `x-openrouter-provider` header) when the gateway "
+        "exposes it; if the column is empty you were routed by a gateway, not pinned."
     )
 
-    # failures -- counted across every concurrency level, not just c=1
+    # failures — counted across every concurrency level, not just the lowest
     totals: dict[str, int] = {}
     errors: dict[str, dict[str, int]] = {}
     for s in samples:
@@ -956,7 +1241,7 @@ def write_report(
         name = s["target"]
         totals[name] = totals.get(name, 0) + 1
         if not s.get("ok"):
-            code = (s.get("error") or "unknown").split(":")[0]
+            code = error_class(s)
             errors.setdefault(name, {})
             errors[name][code] = errors[name].get(code, 0) + 1
     if errors:
@@ -978,7 +1263,7 @@ def write_report(
     report = "\n".join(lines) + "\n"
     (run_dir / "report.md").write_text(report, encoding="utf-8")
 
-    # csv
+    # csv: one row per prompt × provider × concurrency, each with its own stats
     with open(run_dir / "summary.csv", "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -997,35 +1282,34 @@ def write_report(
                 "ok",
                 "n",
                 "errors",
+                "first_content_p50_s",
+                "count_source",
+                "served_by",
             ]
         )
-        for (prompt, target), slot in sorted(per_stream.items()):
-            concs = sorted(
-                {c for (p, t, c) in aggregate if p == prompt and t == target}
+        for (prompt, target, conc), bucket in sorted(buckets.items()):
+            st = bucket_stats(bucket)
+            writer.writerow(
+                [
+                    prompt,
+                    target,
+                    conc,
+                    fmt(st["ttft_p50_s"], 3),
+                    fmt(st["ttft_p90_s"], 3),
+                    fmt(st["out_tps_p50"]),
+                    fmt(st["out_tps_p90"]),
+                    fmt(st["itl_p50_ms"]),
+                    fmt(st["e2e_p50_s"], 3),
+                    fmt(st["aggregate_tps"]),
+                    fmt(st["out_tokens_median"], 0),
+                    st["ok"],
+                    st["n"],
+                    "; ".join(f"{k}×{v}" for k, v in st["errors"].items()),
+                    fmt(st["first_content_p50_s"], 3),
+                    ";".join(st["count_source"]),
+                    ";".join(st["served_by"]),
+                ]
             )
-            for conc in concs:
-                agg = aggregate.get((prompt, target, conc), {})
-                agg_tps = (
-                    statistics.median(agg["batches"]) if agg.get("batches") else None
-                )
-                writer.writerow(
-                    [
-                        prompt,
-                        target,
-                        conc,
-                        fmt(percentile(slot["ttft"], 0.5), 3),
-                        fmt(percentile(slot["ttft"], 0.9), 3),
-                        fmt(percentile(slot["tps"], 0.5)),
-                        fmt(percentile(slot["tps"], 0.9)),
-                        fmt(percentile(slot["itl"], 0.5)),
-                        fmt(percentile(slot["e2e"], 0.5), 3),
-                        fmt(agg_tps),
-                        fmt(statistics.median(slot["out"]) if slot["out"] else None, 0),
-                        slot["ok"],
-                        slot["n"],
-                        "; ".join(f"{k}×{v}" for k, v in slot["errors"].items()),
-                    ]
-                )
 
     return report
 
@@ -1042,26 +1326,42 @@ def fetch_endpoints(
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """Return (canonical_slug, endpoints, raw_payload) for one model."""
     if from_json:
-        payload = json.loads(from_json.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(from_json.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise UsageError(f"cannot read {from_json}: {exc.strerror}") from exc
+        except json.JSONDecodeError as exc:
+            raise UsageError(f"{from_json} is not JSON: {exc}") from exc
     else:
         url = f"https://openrouter.ai/api/v1/models/{model_slug.strip('/')}/endpoints"
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        response = httpx.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+        try:
+            response = httpx.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"could not reach OpenRouter: {type(exc).__name__}: {exc}") from exc
+        if response.status_code == 404:
+            raise UsageError(
+                f"model not found on OpenRouter: {model_slug} — use the author/slug "
+                "shown on openrouter.ai/models"
+            )
         if response.status_code >= 400:
             raise ProviderError(
                 f"GET {url} -> {response.status_code}: {response.text[:300]}",
                 status=response.status_code,
             )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProviderError(f"GET {url} returned non-JSON") from exc
 
-    data = payload.get("data", payload)
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
     if isinstance(data, list):
         data = data[0] if data else {}
     endpoints = data.get("endpoints") or []
     if not endpoints:
-        raise ProviderError("no endpoints in response — dump it with --json and inspect")
+        raise ProviderError("no endpoints in response — dump it with --json-out and inspect")
     canonical = data.get("id") or data.get("slug") or model_slug
     return canonical, endpoints, payload
 
@@ -1081,12 +1381,8 @@ def normalize_endpoints(endpoints: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "context_length": endpoint.get("context_length"),
                 "price_in_per_1m": _per_million(pricing.get("prompt")),
                 "price_out_per_1m": _per_million(pricing.get("completion")),
-                "reported_p50_throughput": _stat(
-                    endpoint.get("throughput_last_30m"), "p50"
-                ),
-                "reported_p50_latency_s": _stat(
-                    endpoint.get("latency_last_30m"), "p50"
-                ),
+                "reported_p50_throughput": _stat(endpoint.get("throughput_last_30m"), "p50"),
+                "reported_p50_latency_s": _stat(endpoint.get("latency_last_30m"), "p50"),
             }
         )
     return rows
@@ -1133,24 +1429,25 @@ def targets_toml(canonical: str, endpoints: list[dict[str, Any]]) -> tuple[str, 
     # labelling the row "priority" would silently measure the wrong thing.
     groups: dict[str, list[dict[str, Any]]] = {}
     for endpoint in endpoints:
-        groups.setdefault(str(endpoint.get("tag") or provider_slug(endpoint)), []).append(
-            endpoint
-        )
+        groups.setdefault(str(endpoint.get("tag") or provider_slug(endpoint)), []).append(endpoint)
+
+    def price_key(e: dict[str, Any]) -> float:
+        pricing = e.get("pricing") or {}
+        price_in = _per_million(pricing.get("prompt"))
+        price_out = _per_million(pricing.get("completion"))
+        return (1e9 if price_in is None else price_in) + (1e9 if price_out is None else price_out)
 
     collapsed = 0
     labels: dict[str, int] = {}
     for tag, group in groups.items():
-        group.sort(
-            key=lambda e: (_per_million((e.get("pricing") or {}).get("prompt")) or 1e9)
-            + (_per_million((e.get("pricing") or {}).get("completion")) or 1e9)
-        )
+        group.sort(key=price_key)
         endpoint = group[0]
         collapsed += len(group) - 1
 
         quant = endpoint.get("quantization")
         if quant in (None, "unknown"):
             quant = None
-        label = _text(endpoint.get("provider_name"), 40) or tag
+        label = _text(endpoint.get("provider_name"), 40) if endpoint.get("provider_name") else tag
         if quant:
             label = f"{label} ({quant})"
         tier = endpoint.get("service_tier")
@@ -1165,20 +1462,20 @@ def targets_toml(canonical: str, endpoints: list[dict[str, Any]]) -> tuple[str, 
         price_out = _per_million(pricing.get("completion"))
 
         blocks.append("[[targets]]")
-        blocks.append(f'name = "{label}"')
+        blocks.append(f"name = {_toml_inline(label)}")
         if len(group) > 1:
             blocks.append(f"# {len(group)} endpoints share this pin; cheapest kept")
         blocks.append('base_url = "https://openrouter.ai/api/v1"')
-        blocks.append(f'model = "{canonical}"')
+        blocks.append(f"model = {_toml_inline(canonical)}")
         blocks.append('api_key_env = "OPENROUTER_API_KEY"')
         pin: dict[str, Any] = {"only": [tag], "allow_fallbacks": False}
         if quant:
             pin["quantizations"] = [quant]
         blocks.append("extra_body.provider = " + _toml_inline(pin))
         price = {}
-        if price_in:
+        if price_in is not None:
             price["in_per_1m"] = round(price_in, 4)
-        if price_out:
+        if price_out is not None:
             price["out_per_1m"] = round(price_out, 4)
         if price:
             blocks.append("price = " + _toml_inline(price))
@@ -1193,7 +1490,7 @@ def discover(
     from_json: Path | None,
     json_out: Path | None,
 ) -> None:
-    """Backwards-compatible convenience wrapper: print, write, report."""
+    """Library convenience wrapper: print the table, optionally write a config."""
     canonical, endpoints, payload = fetch_endpoints(model_slug, api_key, from_json)
     if json_out:
         json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1257,7 +1554,7 @@ def _toml_inline(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        return json.dumps(value)
+        return json.dumps(value)  # JSON string escapes are valid TOML basic strings
     return str(value)
 
 
@@ -1272,15 +1569,19 @@ def _toml_inline(value: Any) -> str:
 # Signal used here: greedy decoding at temperature 0 is a near-deterministic
 # function of the weights. Identical weights + identical kernels reproduce the
 # same tokens; fp4 vs fp8 diverges within a few dozen tokens; a distilled
-# model diverges almost immediately. Two confounders are handled explicitly:
+# model diverges almost immediately. Three confounders are handled explicitly:
 #
 #   1. batching/numerics make *any* endpoint non-deterministic, so each target
-#      is sampled twice and its self-agreement is the noise floor. Cross-target
-#      agreement is only meaningful relative to that floor.
+#      is sampled twice and its self-agreement is the noise floor. A target
+#      below the floor can't be placed, so it never decides the verdict.
 #   2. tokenizer/template differences change `usage.prompt_tokens` for the same
 #      input string, which is cheap to read and impossible to explain away.
+#   3. a target that errored has no data. It is listed separately, never
+#      counted as "different weights".
 #
-# This is evidence, not proof. Treat the clusters as "worth investigating".
+# This is evidence, not proof. Treat a split as "worth investigating".
+
+NOISE_FLOOR = 0.98
 
 
 @dataclass
@@ -1322,20 +1623,17 @@ async def fingerprint_once(
     body.update(target.extra_body)
 
     headers = {"Content-Type": "application/json"}
-    if target.key():
-        headers["Authorization"] = f"Bearer {target.key()}"
+    key = target.key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     headers.update(target.headers)
 
     result = Fingerprint(target=target.name, prompt=prompt_name, rep=rep, ok=False)
     try:
         response = await client.post(target.url(), json=body, headers=headers)
         if response.status_code >= 400:
-            text = response.text[:600]
-            if (
-                use_logprobs
-                and response.status_code in (400, 422)
-                and "logprob" in text.lower()
-            ):
+            text = redact(response.text, target.secrets())[:600]
+            if use_logprobs and response.status_code in (400, 422) and "logprob" in text.lower():
                 # provider doesn't implement logprobs; exact-text mode still
                 # detects "different model" but not "same model, different quant"
                 return await fingerprint_once(
@@ -1344,13 +1642,19 @@ async def fingerprint_once(
             result.error = f"http_{response.status_code}: {text}"
             return result
         payload = response.json()
-    except (httpx.HTTPError, OSError) as exc:
-        result.error = f"transport: {type(exc).__name__}: {exc}"
+    except httpx.TimeoutException:
+        result.error = "timeout"
         return result
-    except json.JSONDecodeError:
+    except (httpx.HTTPError, OSError) as exc:
+        result.error = redact(f"transport: {type(exc).__name__}: {exc}", target.secrets())
+        return result
+    except ValueError:
         result.error = "non_json_response"
         return result
 
+    if not isinstance(payload, dict):
+        result.error = "non_json_response"
+        return result
     usage = payload.get("usage") or {}
     result.prompt_tokens = usage.get("prompt_tokens")
     result.completion_tokens = usage.get("completion_tokens")
@@ -1378,24 +1682,32 @@ async def fingerprint_once(
     return result
 
 
-def token_agreement(a: list[str], b: list[str], mode_a: str, mode_b: str) -> tuple[float, int | None]:
-    """Fraction of aligned token positions that match, and first divergence."""
+def token_agreement(
+    a: list[str], b: list[str], mode_a: str, mode_b: str
+) -> tuple[float, int | None]:
+    """Fraction of token positions that match, and the first divergence.
+
+    The denominator is the *longer* sequence: a completion that stops early is
+    a different completion, not a perfect match on its prefix.
+    """
     if mode_a == "text" or mode_b == "text":
         # coarse: whole-string equality when token ids aren't available
         if not a or not b:
             return 0.0, None
         return (1.0 if a == b else 0.0), (None if a == b else 0)
-    n = min(len(a), len(b))
-    if n == 0:
+    longest = max(len(a), len(b))
+    if longest == 0:
         return 0.0, None
     same = 0
     first = None
-    for i in range(n):
+    for i in range(min(len(a), len(b))):
         if a[i] == b[i]:
             same += 1
         elif first is None:
             first = i
-    return same / n, first
+    if first is None and len(a) != len(b):
+        first = min(len(a), len(b))
+    return same / longest, first
 
 
 def compare_prints(a: Fingerprint, b: Fingerprint) -> tuple[float, int | None]:
@@ -1410,35 +1722,43 @@ def compare_prints(a: Fingerprint, b: Fingerprint) -> tuple[float, int | None]:
 
 
 def self_agreement_map(
-    prints: list["Fingerprint"], targets: list[str], prompts: list[str]
+    prints: list[Fingerprint], targets: list[str], prompts: list[str]
 ) -> dict[str, float]:
     """Worst-case agreement of each target with itself across reps."""
+    return {t: v for t, (v, _first) in _self_agreement(prints, targets, prompts).items()}
+
+
+def _self_agreement(
+    prints: list[Fingerprint], targets: list[str], prompts: list[str]
+) -> dict[str, tuple[float, int | None]]:
     by_key = {(f.target, f.prompt, f.rep): f for f in prints}
-    result: dict[str, float] = {}
+    result: dict[str, tuple[float, int | None]] = {}
     for target in targets:
-        best: float | None = None
         for prompt in prompts:
             a = by_key.get((target, prompt, 0))
             b = by_key.get((target, prompt, 1))
             if not a or not b or not a.ok or not b.ok:
                 continue
-            frac, _ = compare_prints(a, b)
-            if best is None or frac < best:
-                best = frac
-        if best is not None:
-            result[target] = best
+            frac, first = compare_prints(a, b)
+            if target not in result or frac < result[target][0]:
+                result[target] = (frac, first)
     return result
 
 
 def cluster_targets(
-    prints: list["Fingerprint"],
+    prints: list[Fingerprint],
     targets: list[str],
     prompt: str,
     self_agree: dict[str, float],
 ) -> list[list[str]]:
-    """Union targets whose agreement clears both noise floors."""
+    """Union targets whose agreement clears both noise floors.
+
+    Only targets that returned data for `prompt` are clustered; a failed
+    request is absence of evidence, not a different artifact.
+    """
     by_key = {(f.target, f.prompt, f.rep): f for f in prints}
-    parent: dict[str, str] = {t: t for t in targets}
+    present = [t for t in targets if (f := by_key.get((t, prompt, 0))) is not None and f.ok]
+    parent: dict[str, str] = {t: t for t in present}
 
     def find(x: str) -> str:
         while parent[x] != x:
@@ -1451,34 +1771,85 @@ def cluster_targets(
         if ra != rb:
             parent[rb] = ra
 
-    for i, a_name in enumerate(targets):
-        for b_name in targets[i + 1:]:
-            a = by_key.get((a_name, prompt, 0))
-            b = by_key.get((b_name, prompt, 0))
-            if not a or not b or not a.ok or not b.ok:
-                continue
-            frac, _ = compare_prints(a, b)
+    for i, a_name in enumerate(present):
+        for b_name in present[i + 1 :]:
+            frac, _ = compare_prints(by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)])
             floor = min(self_agree.get(a_name, 1.0), self_agree.get(b_name, 1.0))
-            if frac >= max(0.98, floor - 0.01):
+            if frac >= max(NOISE_FLOOR, floor - 0.01):
                 union(a_name, b_name)
 
     groups: dict[str, list[str]] = {}
-    for target in targets:
+    for target in present:
         groups.setdefault(find(target), []).append(target)
     return sorted(groups.values(), key=len, reverse=True)
 
 
-def fingerprint_reports(
+def fingerprint_summary(
     prints: list[Fingerprint], targets: list[str], prompts: list[str]
-) -> str:
-    by_key: dict[tuple[str, str, int], Fingerprint] = {}
-    for item in prints:
-        by_key[(item.target, item.prompt, item.rep)] = item
+) -> dict[str, Any]:
+    """Everything the report, terminal and --json output say about a fingerprint."""
+    by_key = {(f.target, f.prompt, f.rep): f for f in prints}
+    prompt = prompts[0]
+    selfs = _self_agreement(prints, targets, prompts)
+    self_agree = {t: v for t, (v, _f) in selfs.items()}
+    present = [t for t in targets if (f := by_key.get((t, prompt, 0))) is not None and f.ok]
+    no_data = {}
+    for target in targets:
+        if target in present:
+            continue
+        attempts = [f for f in prints if f.target == target and f.prompt == prompt]
+        no_data[target] = next((f.error for f in attempts if f.error), "no response")
+    # Only a target whose noise floor was *measured* and is high can weigh in.
+    # No floor (one rep, or its second rep failed) is unknown, not deterministic.
+    noisy = [t for t in present if t in self_agree and self_agree[t] < NOISE_FLOOR]
+    unmeasured = [t for t in present if t not in self_agree]
+    deterministic = [t for t in present if t in self_agree and self_agree[t] >= NOISE_FLOOR]
+    clusters = cluster_targets(prints, targets, prompt, self_agree)
+    firm_groups = [g for g in clusters if any(t in deterministic for t in g)]
+    if len(deterministic) < 2:
+        verdict = "inconclusive"
+    elif len(firm_groups) > 1:
+        verdict = "split"
+    else:
+        verdict = "consistent"
+
+    pairs = []
+    for i, a_name in enumerate(present):
+        for b_name in present[i + 1 :]:
+            frac, first = compare_prints(by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)])
+            pairs.append(
+                {"a": a_name, "b": b_name, "agreement": round(frac, 4), "first_divergence": first}
+            )
+    prompt_tokens = {
+        t: (by_key[(t, prompt, 0)].prompt_tokens if (t, prompt, 0) in by_key else None)
+        for t in targets
+    }
+    return {
+        "verdict": verdict,
+        "clusters": clusters,
+        "no_data": no_data,
+        "noisy": noisy,
+        "unmeasured": unmeasured,
+        "distinguishable_groups": len(firm_groups),
+        "noise_floor_measured": bool(self_agree),
+        "self_agreement": {k: round(v, 4) for k, v in self_agree.items()},
+        "self_first_divergence": {k: f for k, (_v, f) in selfs.items()},
+        "pairs": pairs,
+        "prompt_tokens": prompt_tokens,
+        "prompt_used": prompt,
+    }
+
+
+def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: list[str]) -> str:
+    by_key = {(item.target, item.prompt, item.rep): item for item in prints}
+    summary = fingerprint_summary(prints, targets, prompts)
+    self_agree = summary["self_agreement"]
+    prompt = summary["prompt_used"]
 
     lines: list[str] = ["# Fingerprint: same weights or just the same name?", ""]
     lines.append(
         "Greedy decode (temp 0). `self` = the provider's agreement with itself "
-        "across reps — its noise floor. `vs` agreement below the floor is not "
+        "across reps — its noise floor. Agreement below that floor is not "
         "evidence of different weights."
     )
     lines.append("")
@@ -1488,79 +1859,70 @@ def fingerprint_reports(
     lines.append("")
     lines.append("| provider | prompt_tokens (same input) | completion_tokens | logprobs |")
     lines.append("|---|---|---|---|")
-    signatures: dict[str, set[int]] = {}
+    signatures: dict[int, set[str]] = {}
     for target in targets:
-        value = None
-        mode = "?"
-        for prompt in prompts:
-            item = by_key.get((target, prompt, 0))
-            if item and item.prompt_tokens is not None:
-                value = item.prompt_tokens
-                break
-        any_item = next(
-            (by_key.get((target, p, 0)) for p in prompts if by_key.get((target, p, 0))),
+        item = next(
+            (by_key[(target, p, 0)] for p in prompts if (target, p, 0) in by_key),
             None,
         )
-        if any_item:
-            mode = any_item.mode
+        value = item.prompt_tokens if item and item.ok else None
         if value is not None:
-            signatures.setdefault(str(value), set()).add(target)
-        lines.append(f"| {target} | {value if value is not None else '—'} | "
-                     f"{any_item.completion_tokens if any_item else '—'} | {mode} |")
+            signatures.setdefault(value, set()).add(target)
+        completion = item.completion_tokens if item and item.ok else None
+        mode = item.mode if item and item.ok else "—"
+        lines.append(
+            f"| {target} | {'—' if value is None else value} | "
+            f"{'—' if completion is None else completion} | {mode} |"
+        )
     lines.append("")
     if len(signatures) > 1:
         groups = "; ".join(
-            f"{count} → {', '.join(sorted(names))}" for count, names in
-            ((len(v), v) for v in signatures.values())
+            f"{count} tokens → {', '.join(sorted(names))}"
+            for count, names in sorted(signatures.items())
         )
         lines.append(
-            f"⚠ {len(signatures)} distinct prompt-token counts for identical input. "
-            f"Different tokenizer or chat template: {groups}."
+            f"⚠ {len(signatures)} distinct prompt-token counts for identical input — "
+            f"different tokenizer or chat template: {groups}."
         )
-    else:
+    elif signatures:
         lines.append(
-            "All providers tokenized the probe identically — consistent with one "
+            "All providers with data tokenized the probe identically — consistent with one "
             "tokenizer/template, which is necessary but not sufficient."
         )
+    else:
+        lines.append("No provider reported `usage.prompt_tokens`.")
     lines.append("")
 
     # 2. self-agreement noise floor
     lines.append("## Self-agreement (noise floor)")
     lines.append("")
-    lines.append("| provider | token agreement rep0 vs rep1 | first divergence |")
-    lines.append("|---|---|---|")
-    self_agree: dict[str, float] = {}
-    for target in targets:
-        best: float | None = None
-        first_div: int | None = None
-        for prompt in prompts:
-            a = by_key.get((target, prompt, 0))
-            b = by_key.get((target, prompt, 1))
-            if not a or not b or not a.ok or not b.ok:
-                continue
-            frac, first = compare_prints(a, b)
-            if best is None or frac < best:
-                best = frac
-                first_div = first
-        if best is not None:
-            self_agree[target] = best
+    if not summary["noise_floor_measured"]:
         lines.append(
-            f"| {target} | {'—' if best is None else f'{best * 100:.1f}%'} | "
-            f"{'—' if first_div is None else first_div} |"
-        )
-    lines.append("")
-    noisy = [t for t, v in self_agree.items() if v < 0.98]
-    if noisy:
-        lines.append(
-            f"⚠ Non-deterministic at temp 0: {', '.join(noisy)}. Their cross-provider "
-            "agreement cannot be interpreted — the endpoint itself varies run to run."
+            "Not measured — it needs two successful reps per provider (`--reps 2`, the "
+            "default). Without a noise floor, cross-provider agreement can't be interpreted."
         )
     else:
-        lines.append("Every provider reproduced itself near-exactly at temp 0.")
+        lines.append("| provider | token agreement rep0 vs rep1 | first divergence |")
+        lines.append("|---|---|---|")
+        for target in targets:
+            value = self_agree.get(target)
+            first_div = summary["self_first_divergence"].get(target)
+            lines.append(
+                f"| {target} | {'—' if value is None else f'{value * 100:.1f}%'} | "
+                f"{'—' if first_div is None else first_div} |"
+            )
+        lines.append("")
+        if summary["noisy"]:
+            lines.append(
+                f"⚠ Non-deterministic at temp 0: {', '.join(summary['noisy'])}. Their "
+                "cross-provider agreement can't be interpreted — the endpoint itself varies "
+                "run to run — so they never decide the verdict."
+            )
+        else:
+            lines.append("Every provider with two successful reps reproduced itself near-exactly.")
     lines.append("")
 
     # 3. pairwise agreement, first prompt
-    prompt = prompts[0]
     lines.append(f"## Pairwise agreement — `{prompt}`")
     lines.append("")
     if len(targets) <= 12:
@@ -1582,12 +1944,10 @@ def fingerprint_reports(
                 cells.append(f"{frac * 100:.0f}")
             lines.append(f"| **{a_name}** | " + " | ".join(cells) + " |")
         lines.append("")
-        lines.append("Diagonal = self-agreement. Values are % of aligned tokens identical.")
+        lines.append("Diagonal = self-agreement. Values are % of token positions identical.")
         lines.append("")
     else:
-        lines.append(
-            "Too many targets for a matrix; showing each provider's nearest neighbours."
-        )
+        lines.append("Too many targets for a matrix; showing each provider's nearest neighbours.")
         lines.append("")
         lines.append("| provider | closest peers (≥99%) | nearest other |")
         lines.append("|---|---|---|")
@@ -1596,10 +1956,8 @@ def fingerprint_reports(
             scored = []
             if a and a.ok:
                 for b_name in targets:
-                    if b_name == a_name:
-                        continue
                     b = by_key.get((b_name, prompt, 0))
-                    if not b or not b.ok:
+                    if b_name == a_name or not b or not b.ok:
                         continue
                     frac, _ = compare_prints(a, b)
                     scored.append((frac, b_name))
@@ -1609,25 +1967,44 @@ def fingerprint_reports(
             lines.append(f"| {a_name} | {', '.join(peers) or '—'} | {nearest} |")
         lines.append("")
 
-    # 4. clusters
-    groups = cluster_targets(prints, targets, prompt, self_agree)
-
+    # 4. clusters + verdict
     lines.append("## Clusters")
     lines.append("")
-    for index, members in enumerate(groups, start=1):
-        lines.append(f"- **group {index}** ({len(members)}): {', '.join(members)}")
-    lines.append("")
-    if len(groups) == 1:
+    unweighed = set(summary["noisy"]) | set(summary["unmeasured"])
+    for index, members in enumerate(summary["clusters"], start=1):
+        note = (
+            " — no deterministic noise floor, can't be placed"
+            if all(m in unweighed for m in members)
+            else ""
+        )
+        lines.append(f"- **group {index}** ({len(members)}): {', '.join(members)}{note}")
+    for target, error in summary["no_data"].items():
         lines.append(
-            "One group: indistinguishable at this resolution. Consistent with the "
-            "same weights, but token-level agreement can't see small quality "
-            "differences — a distilled model sometimes survives 150 tokens."
+            f"- *no data*: {target} — `{error.split(':')[0]}` (excluded; not evidence of anything)"
+        )
+    if summary["noise_floor_measured"]:
+        for target in summary["unmeasured"]:
+            lines.append(f"- *no noise floor*: {target} — its second rep failed; not weighed")
+    lines.append("")
+    verdict = summary["verdict"]
+    if verdict == "split":
+        lines.append(
+            f"**Verdict: split.** {summary['distinguishable_groups']} distinguishable groups. "
+            "Members of different groups are *not* serving the same "
+            "artifact: expect different quantization, revision, or model. Confirm with a task "
+            "eval before assuming the cheaper one is equivalent."
+        )
+    elif verdict == "consistent":
+        lines.append(
+            "**Verdict: consistent.** Indistinguishable at this resolution — consistent with "
+            "the same weights, but token-level agreement can't see small quality differences; "
+            "a distilled model sometimes survives 150 tokens."
         )
     else:
         lines.append(
-            f"{len(groups)} groups. Members of different groups are *not* the same "
-            "artifact: expect different quantization, revision, or model. Confirm "
-            "with a task eval before assuming the cheaper one is equivalent."
+            "**Verdict: inconclusive.** Fewer than two providers have a measured, "
+            "deterministic noise floor (two successful reps each, ≥98% self-agreement), so "
+            "differences between them can't be told apart from noise."
         )
     lines.append("")
     lines.append(
@@ -1638,26 +2015,34 @@ def fingerprint_reports(
     return "\n".join(lines) + "\n"
 
 
-def mock_fingerprint(target: Target, prompt: str, rep: int) -> Fingerprint:
-    """Three synthetic 'weight families' so the clustering demo has structure."""
+def mock_fingerprint(target: Target, prompt: str, prompt_text: str, rep: int) -> Fingerprint:
+    """Three synthetic 'weight families' so the clustering demo has structure.
+
+    Family 0 is the reference; family 1 shares a long prefix (same base, other
+    quantization); family 2 diverges early and tokenizes differently (another
+    model). About one target in eleven is non-deterministic. A target's mock
+    profile can pin both: `mock = { family = 1, noisy = true }`.
+    """
     import hashlib
 
-    family = int(hashlib.sha256(target.name.encode()).hexdigest(), 16) % 3
-    tokens = [f"tok{i}_{family}" for i in range(150)]
-    # roughly one target in eleven is non-deterministic, so the demo shows the
-    # "its own noise floor is too high to judge" warning instead of hiding it
-    if rep == 1 and int(hashlib.sha256(target.name.encode()).hexdigest(), 16) % 11 == 0:
+    prof = target.mock or {}
+    digest = int(hashlib.sha256(target.name.encode()).hexdigest(), 16)
+    family = int(prof.get("family", digest % 3)) % 3
+    tokens = [f"t{i}" for i in range(150)]
+    diverge = {0: None, 1: 96, 2: 14}[family]
+    if diverge is not None:
+        tokens[diverge:] = [f"f{family}_{i}" for i in range(150 - diverge)]
+    if rep == 1 and prof.get("noisy", digest % 11 == 0):
         tokens[70:] = [f"alt{i}" for i in range(80)]
-    text = " ".join(tokens)
     return Fingerprint(
         target=target.name,
         prompt=prompt,
         rep=rep,
         ok=True,
-        text=text,
+        text=" ".join(tokens),
         tokens=tokens,
         logprobs=[-0.1] * len(tokens),
-        prompt_tokens=len(prompt) // 4,
+        prompt_tokens=estimate_tokens(prompt_text) + (9 if family == 2 else 0),
         completion_tokens=len(tokens),
         mode="tokens",
     )
@@ -1670,47 +2055,75 @@ def run_fingerprint(
     reps: int,
     prompt_count: int,
     mock: bool,
-    on_progress=None,
-) -> str:
+    on_progress: Callable[..., None] | None = None,
+) -> tuple[str, list[Fingerprint], dict[str, Any]]:
     prompt_names = list(cfg.prompts)[:prompt_count]
     prints: list[Fingerprint] = []
+    total = len(prompt_names) * reps * len(cfg.targets)
 
-    async def go() -> None:
+    async def go(flush: Callable[[], None]) -> None:
         async with httpx.AsyncClient(
-            http2=HTTP2, timeout=httpx.Timeout(cfg.timeout_s, connect=15.0)
+            http2=HTTP2,
+            timeout=httpx.Timeout(cfg.timeout_s, connect=15.0),
+            headers={"User-Agent": USER_AGENT},
         ) as client:
             for prompt_name in prompt_names:
                 text = build_prompt(cfg.prompts[prompt_name])
                 for rep in range(reps):
                     for target in cfg.targets:
-                        if mock:
-                            prints.append(mock_fingerprint(target, prompt_name, rep))
-                            continue
                         if on_progress is not None:
-                            on_progress(target=target.name, prompt=prompt_name, rep=rep)
-                        prints.append(
-                            await fingerprint_once(
-                                client, target, text, prompt_name, max_tokens, cfg, rep
+                            on_progress(
+                                done=len(prints),
+                                total=total,
+                                target=target.name,
+                                prompt=prompt_name,
+                                rep=rep,
                             )
-                        )
+                        if mock:
+                            prints.append(mock_fingerprint(target, prompt_name, text, rep))
+                        else:
+                            prints.append(
+                                await fingerprint_once(
+                                    client, target, text, prompt_name, max_tokens, cfg, rep
+                                )
+                            )
+                        flush()
 
-    asyncio.run(go())
-
+    names = [t.name for t in cfg.targets]
     outdir.mkdir(parents=True, exist_ok=True)
+
+    def render(partial: bool) -> str:
+        report = fingerprint_reports(prints, names, prompt_names)
+        if partial:
+            report = (
+                "> **PARTIAL** — interrupted; only the requests that finished are compared.\n\n"
+                + report
+            )
+        if mock:
+            report = (
+                "> **MOCK** — synthetic data for pipeline testing, not measurements.\n\n" + report
+            )
+        (outdir / "fingerprint.md").write_text(report, encoding="utf-8")
+        return report
+
     with open(outdir / "fingerprints.jsonl", "w", encoding="utf-8") as handle:
-        for item in prints:
-            handle.write(json.dumps(item.__dict__) + "\n")
+        written = 0
 
-    report = fingerprint_reports(prints, [t.name for t in cfg.targets], prompt_names)
-    if mock:
-        report = (
-            "> **MOCK** — synthetic data for pipeline testing, not measurements.\n\n"
-            + report
-        )
-    (outdir / "fingerprint.md").write_text(report, encoding="utf-8")
-    return report
+        def flush() -> None:
+            nonlocal written
+            for item in prints[written:]:
+                handle.write(json.dumps(item.__dict__) + "\n")
+            written = len(prints)
+            handle.flush()
 
+        try:
+            asyncio.run(go(flush))
+        except KeyboardInterrupt:
+            flush()
+            if prints:
+                render(partial=True)
+            raise
+        flush()
 
-# --------------------------------------------------------------------------
-# cli
-# --------------------------------------------------------------------------
+    report = render(partial=False)
+    return report, prints, fingerprint_summary(prints, names, prompt_names)

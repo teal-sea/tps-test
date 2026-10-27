@@ -1,21 +1,42 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tps-test"
+name = "tpsbench"
 version = "0.1.0"
 description = "Measure one model across many providers and gateways: TTFT, inter-token latency, throughput, cost, and whether they serve the same weights."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-keywords = ["llm", "benchmark", "throughput", "latency", "providers", "gateways"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Thomas Lince" }]
+keywords = ["llm", "benchmark", "throughput", "latency", "providers", "gateways", "openrouter"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Benchmark",
+]
 dependencies = ["httpx>=0.27"]
 
 [project.optional-dependencies]
 http2 = ["h2>=4"]
 dev = ["ruff>=0.6"]
-docs = ["mkdocs>=1.6"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
+# regenerating docs/assets/ (scripts/render_assets.py); not needed to use tps
+assets = ["fonttools>=4.50", "uharfbuzz>=0.39"]
+
+[project.urls]
+Homepage = "https://github.com/teal-sea/tpsbench"
+Documentation = "https://github.com/teal-sea/tpsbench/tree/main/docs"
+Issues = "https://github.com/teal-sea/tpsbench/issues"
 
 [project.scripts]
 tps = "tps.cli:main"

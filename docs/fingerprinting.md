@@ -16,7 +16,8 @@ tps fingerprint -c targets.toml
 2. Each target's two runs are compared with each other — that's its **noise
    floor**. Batching and kernel nondeterminism mean no endpoint is bit-exact
    across calls.
-3. Targets are compared with each other on the token sequence of run 1.
+3. Targets are compared with each other on the token sequence of run 1. A
+   completion that stops early counts the missing tokens as disagreement.
 4. Cache aside, greedy decoding is nearly a function of the weights. Identical
    weights and kernels reproduce the same tokens; fp4 vs fp8 diverges within a few
    dozen tokens; a distilled model diverges almost immediately.
@@ -34,12 +35,37 @@ tps fingerprint -c targets.toml
 | `prompt_tokens` differ for identical input | different tokenizer or chat template; not the same serving stack |
 
 Clusters are the summary: targets are unioned when their agreement clears both
-their noise floors (`max(0.98, min_floor − 0.01)`).
+their noise floors (`max(0.98, min_floor − 0.01)`). The **verdict** reads them:
+
+| Verdict | Meaning |
+|---|---|
+| `split` | two or more distinguishable groups among deterministic targets |
+| `consistent` | one group — indistinguishable at this resolution |
+| `inconclusive` | fewer than two targets with a measured, deterministic noise floor |
+
+Only a target whose noise floor was **measured** (two successful reps) and is
+high (≥ 98% self-agreement) can move the verdict. Three kinds never do:
+
+- a target whose request **failed** — listed under *no data*: absence of
+  evidence, not different weights;
+- a target that is **non-deterministic** at temperature 0 — `noisy`: its
+  placement can't be interpreted;
+- a target with **no measured floor** — `unmeasured`: its second rep failed, or
+  the run used `--reps 1`. With `--reps 1` nobody has a floor, so the verdict is
+  always `inconclusive`.
+
+![tps fingerprint output — demo data](assets/screenshot-fingerprint.svg)
 
 ## What it costs
 
 11 targets × 2 prompts × 2 reps × 160 tokens ≈ 7k tokens. A few cents and about a
 minute. Run it before you write a pricing decision into anything.
+
+Try the output offline, with fictional providers:
+
+```bash
+tps fingerprint -c examples/fingerprint-demo.toml --mock
+```
 
 ## Limits — read these
 
