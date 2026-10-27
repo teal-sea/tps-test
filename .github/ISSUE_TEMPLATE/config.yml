@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/teal-sea/tps-test/blob/main/docs/troubleshooting.md
+    about: The errors you will actually hit, and what each exit code means
+  - name: Report a security vulnerability
+    url: https://github.com/teal-sea/tps-test/security/advisories/new
+    about: Please report security issues privately, not as a public issue

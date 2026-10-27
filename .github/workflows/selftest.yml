@@ -6,10 +6,25 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff>=0.6"
+      - run: ruff check .
+      - run: ruff format --check .
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
@@ -30,19 +45,29 @@ jobs:
       - name: CLI smoke test
         run: |
           tps --version
-          tps doctor --no-color || test $? -eq 2   # no keys in CI: 2 is expected
+          tps doctor --no-color || test $? -eq 2        # no keys in CI: 2 is expected
           tps run -c targets.mock.toml --mock --reps 2 --json > run.json
-          jq -e '.ok == true and (.results | length) == 3' run.json
-          tps fingerprint -c targets.mock.toml --mock --reps 2 --prompt-count 1 --json > fp.json
-          jq -e '.schema_version == 1 and (.clusters | length) >= 1' fp.json
+          jq -e '.ok == true and .mock == true and (.results | length) == 3' run.json
+          jq -e '[.results[] | .out_tps_p90 <= .out_tps_p50] | all' run.json   # p90 = slow tail
+          tps fingerprint -c examples/fingerprint-demo.toml --mock --json > fp.json
+          jq -e '.schema_version == 1 and .verdict == "split" and (.noisy | length) == 1' fp.json
+          # mock-only config refuses to run without --mock (exit 1, not fake data)
+          code=0; tps run -c targets.mock.toml || code=$?; test "$code" -eq 1
+          # bad flags exit 1 (never argparse's 2, which means "missing credentials")
+          code=0; tps run --json --reps nope > bad.json || code=$?; test "$code" -eq 1
+          jq -e '.ok == false and .error.code == 1' bad.json
 
   docs:
     runs-on: ubuntu-latest
+    env:
+      NO_MKDOCS_2_WARNING: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - run: pip install ".[docs]"
       # --strict turns broken internal links into a build failure
       - run: mkdocs build --strict
+      # the wiki is generated from docs/; make sure every page maps
+      - run: scripts/publish-wiki.sh --dry-run "$RUNNER_TEMP/wiki"

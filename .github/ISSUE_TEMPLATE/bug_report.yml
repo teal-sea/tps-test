@@ -1,0 +1,31 @@
+name: Bug report
+description: Something measured wrong, crashed, or broke a documented contract
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! **Never paste API keys.** Run `tps doctor` first — it catches most setup problems.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `tps --version`, plus your Python version and OS
+      placeholder: tps 0.1.0 · Python 3.12 · macOS 15
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and config
+      description: The exact command, and the relevant `[[targets]]` blocks (keys removed)
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: Paste the output. For a wrong number, `tps report <run_dir> --markdown` and one line of `raw.jsonl` help most.
+    validations:
+      required: true
