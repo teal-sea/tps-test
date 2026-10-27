@@ -18,12 +18,12 @@ import warnings
 
 from tps.cli import main
 
-warnings.warn(
-    "rig.py is deprecated; use `tps` or `python -m tps`",
-    DeprecationWarning,
-    stacklevel=1,
-)
-
 if __name__ == "__main__":
     print("note: rig.py is deprecated — use `tps` or `python -m tps`", file=sys.stderr)
     raise SystemExit(main())
+
+warnings.warn(
+    "rig.py is deprecated; use `tps` or `python -m tps`",
+    DeprecationWarning,
+    stacklevel=2,
+)

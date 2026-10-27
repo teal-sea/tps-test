@@ -3,12 +3,12 @@
 # Curated from 41 advertised endpoints on 2026-10-27 — 3 quant classes
 # (fp4 / fp8 / unknown) and a 30x spread in input price. Prices below were
 # copied from the discover output and drift daily; re-run
-#   .venv/bin/python rig.py discover deepseek/deepseek-v4.1-flash --out targets.v4.1-flash.full.toml
-# for the current full list (36 pinnable rows).
+#   tps discover deepseek/deepseek-v4.1-flash --out targets.v4.1-flash.full.toml
+# for the current full list (41 pinned targets).
 #
 # First pass, ~20 min and a few cents of spend:
 #   export OPENROUTER_API_KEY=...
-#   .venv/bin/python rig.py run -c targets.v4.1-flash.toml
+#   tps run -c targets.v4.1-flash.toml
 
 [run]
 reps = 7
@@ -117,15 +117,15 @@ extra_body.provider = { only = ["baseten/fast"], allow_fallbacks = false }
 price = { in_per_1m = 0.600, out_per_1m = 2.400 }
 
 # --- control ------------------------------------------------------------
-# No pin. This is what you actually get by default, and the row that tells
-# you whether pinning is worth the effort at all.
+# No provider block at all. This is what you actually get by default
+# (price-weighted routing), and the row that tells you whether pinning is
+# worth the effort. `served by` in the report shows where each request went.
 
 [[targets]]
 name = "openrouter auto"
 base_url = "https://openrouter.ai/api/v1"
 model = "deepseek/deepseek-v4.1-flash"
 api_key_env = "OPENROUTER_API_KEY"
-extra_body.provider = { sort = "throughput" }
 
 # --- first-party baseline (uncomment if your account exposes this model id) ---
 # OpenRouter has no DeepSeek first-party row for this model, so the direct API

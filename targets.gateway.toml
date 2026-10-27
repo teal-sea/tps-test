@@ -15,7 +15,7 @@
 #      Add a second gateway block below, same model, same pins.
 #
 # Run with the baseline set (see [run]) to get Δ columns instead of eyeballing:
-#   .venv/bin/python rig.py run -c targets.gateway.toml
+#   tps run -c targets.gateway.toml
 
 [run]
 reps = 7
