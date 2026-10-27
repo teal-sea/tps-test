@@ -12,3 +12,8 @@ runs/*
 .DS_Store
 .idea/
 .vscode/
+
+# packaging artifacts
+*.egg-info/
+build/
+dist/
