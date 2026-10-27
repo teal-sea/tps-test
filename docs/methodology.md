@@ -1,6 +1,6 @@
 # Methodology
 
-The rig handles mechanics. These are the things that quietly invalidate a
+`tps` handles the mechanics. These are the things that quietly invalidate a
 provider comparison, and what this tool does about each.
 
 ## 1. Pin the upstream, or you are benchmarking a load balancer
@@ -27,7 +27,8 @@ instead of landing on whoever went first.
 ## 4. Warm up, then discard
 
 Two warm-up requests per target establish TLS, HTTP/2 and any provider-side cold
-start, and are excluded from the statistics.
+start, and are excluded from the statistics (they stay in `raw.jsonl` as
+`batch: -1`).
 
 ## 5. Run it twice a day
 
@@ -41,7 +42,7 @@ depth. Both are real; never report one as the other.
 
 ## 7. Note your network position
 
-TTFT contains your RTT to the provider. A rig in Bogotá and a rig in Frankfurt
+TTFT contains your RTT to the provider. A run from Bogotá and a run from Frankfurt
 will disagree, correctly. Record where you ran it.
 
 ## 8. Distrust single-digit samples

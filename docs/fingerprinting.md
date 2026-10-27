@@ -16,7 +16,8 @@ tps fingerprint -c targets.toml
 2. Each target's two runs are compared with each other — that's its **noise
    floor**. Batching and kernel nondeterminism mean no endpoint is bit-exact
    across calls.
-3. Targets are compared with each other on the token sequence of run 1.
+3. Targets are compared with each other on the token sequence of run 1. A
+   completion that stops early counts the missing tokens as disagreement.
 4. Cache aside, greedy decoding is nearly a function of the weights. Identical
    weights and kernels reproduce the same tokens; fp4 vs fp8 diverges within a few
    dozen tokens; a distilled model diverges almost immediately.
@@ -34,12 +35,31 @@ tps fingerprint -c targets.toml
 | `prompt_tokens` differ for identical input | different tokenizer or chat template; not the same serving stack |
 
 Clusters are the summary: targets are unioned when their agreement clears both
-their noise floors (`max(0.98, min_floor − 0.01)`).
+their noise floors (`max(0.98, min_floor − 0.01)`). The **verdict** reads them:
+
+| Verdict | Meaning |
+|---|---|
+| `split` | two or more distinguishable groups among deterministic targets |
+| `consistent` | one group — indistinguishable at this resolution |
+| `inconclusive` | fewer than two deterministic targets returned data |
+
+Two things never move the verdict: a target whose request **failed** (listed
+under *no data* — absence of evidence, not different weights), and a target that
+is **non-deterministic** at temperature 0 (its placement can't be interpreted).
+With `--reps 1` there is no noise floor, and the report says so.
+
+![tps fingerprint output — demo data](assets/screenshot-fingerprint.svg)
 
 ## What it costs
 
 11 targets × 2 prompts × 2 reps × 160 tokens ≈ 7k tokens. A few cents and about a
 minute. Run it before you write a pricing decision into anything.
+
+Try the output offline, with fictional providers:
+
+```bash
+tps fingerprint -c examples/fingerprint-demo.toml --mock
+```
 
 ## Limits — read these
 

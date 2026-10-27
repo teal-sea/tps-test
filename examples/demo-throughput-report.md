@@ -1,38 +1,45 @@
-# Provider throughput rig — demo (MOCK DATA)
+# tps report — demo (MOCK DATA)
 
-- model: `demo-model` · reps 6 · concurrency [1, 4] · temp 0.0 · http2 True
-- captured: 2026-10-27T05:27:16+00:00
+> **MOCK DATA** — synthetic numbers from `--mock`. Not a measurement; never publish them.
 
-TTFT = time to first content token. ITL = gap between content chunks (lower is smoother). tok/s = per-stream decode rate (`completion_tokens / decode_window`). Aggregate = sum of tokens over batch wall clock.
+- model: `demo-model` · reps 7 · concurrency [1, 4] · temp 0.0 · http2 True
+- captured: (demo run — regenerate with scripts/render_assets.py)
+
+TTFT = time to the first generated token (content or reasoning). tok/s = per-stream decode rate across the streaming window. ITL = median gap between content chunks. **p90 is always the slow tail** (for tok/s, the rate 90% of requests met or beat). Aggregate = all tokens of a concurrent batch ÷ its wall clock. Definitions: `docs/metrics.md`.
 
 ## `prose-256` — single stream
 
-| provider | TTFT p50 | TTFT p90 | out tok/s p50 | out tok/s p90 | ITL p50 ms | E2E p50 | out tok | ok |
-|---|---|---|---|---|---|---|---|---|
-| fast-provider | 0.25 | 0.30 | 119.7 | 135.9 | 8.4 | 2.13 | 228 | 6/6 |
-| mid-provider | 0.53 | 0.59 | 53.0 | 60.1 | 18.9 | 5.18 | 236 | 6/6 |
-| slow-provider | 1.11 | 1.29 | 34.0 | 37.1 | 29.4 | 8.19 | 231 | 6/6 |
+| provider | TTFT p50 | TTFT p90 | tok/s p50 | tok/s p90 | ITL p50 ms | E2E p50 | out tok | ok | Δ TTFT vs mid-provider | Δ tok/s vs mid-provider |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fast-provider | 0.32 | 0.34 | 99.7 | 94.3 | 10.0 | 2.54 | 242 | 7/7 | -0.13s | +89% |
+| mid-provider | 0.45 | 0.60 | 52.8 | 49.0 | 18.9 | 4.98 | 231 | 7/7 | — | — |
+| slow-provider | 1.13 | 1.28 | 29.3 | 26.8 | 34.1 | 9.40 | 244 | 7/7 | +0.69s | -45% |
 
 ```
-fast-provider            ████████████████████████████   119.7 tok/s
-mid-provider             ████████████    53.0 tok/s
-slow-provider            ████████    34.0 tok/s
+fast-provider  ████████████████████████████    99.7 tok/s
+mid-provider   ███████████████                 52.8 tok/s
+slow-provider  ████████                        29.3 tok/s
 ```
 
-## `prose-256` — aggregate throughput (tokens/sec)
+## `prose-256` — under load
 
-| provider | c=1 | c=4 |
-|---|---|---|
-| fast-provider | 106.4 | 292.9 |
-| mid-provider | 47.4 | 152.2 |
-| slow-provider | 29.0 | 80.1 |
+| provider | c | aggregate tok/s | vs c=1 | per-stream tok/s p50 | TTFT p50 | ok | errors |
+|---|---|---|---|---|---|---|---|
+| fast-provider | 1 | 88.4 | 1.0× | 99.7 | 0.32 | 7/7 | — |
+| fast-provider | 4 | 312.6 | 3.5× | 96.9 | 0.32 | 28/28 | — |
+| mid-provider | 1 | 48.1 | 1.0× | 52.8 | 0.45 | 7/7 | — |
+| mid-provider | 4 | 122.7 | 2.6× | 36.9 | 0.55 | 28/28 | — |
+| slow-provider | 1 | 25.9 | 1.0× | 29.3 | 1.13 | 7/7 | — |
+| slow-provider | 4 | 35.1 | 1.4× | 10.7 | 1.26 | 28/28 | — |
+
+Aggregate rising roughly with `c` means the provider scales; flat aggregate with collapsing per-stream tok/s means it queues.
 
 ## Cost & provenance
 
 | provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens | served by | token source |
 |---|---|---|---|---|---|---|
-| fast-provider | 0.260 | 0.380 | 0.102 | 0.45 | mock | mock |
-| mid-provider | 0.280 | 0.420 | 0.116 | 0.49 | mock | mock |
-| slow-provider | 0.350 | 0.600 | 0.160 | 0.69 | mock | mock |
+| fast-provider | 0.260 | 0.380 | 0.108 | 0.44 | mock | mock |
+| mid-provider | 0.280 | 0.420 | 0.114 | 0.49 | mock | mock |
+| slow-provider | 0.350 | 0.600 | 0.167 | 0.69 | mock | mock |
 
-> Provider attribution comes from the response (`provider` field or `x-openrouter-provider` header) when the gateway exposes it. If that column is empty you were routed by a gateway, not pinned to an upstream.
+> Cost uses the median request across all prompts. Provider attribution comes from the response (`provider` field or `x-openrouter-provider` header) when the gateway exposes it; if the column is empty you were routed by a gateway, not pinned.

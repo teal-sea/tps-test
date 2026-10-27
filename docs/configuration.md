@@ -12,8 +12,8 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `warmup` | `2` | discarded requests per target (TLS, cold start) |
 | `temperature` | `0.0` | keep at 0 for comparability |
 | `timeout_s` | `180` | per-request read timeout |
-| `prompts` | first two built-ins | names defined under `[prompts]` or built-in |
-| `baseline` | none | target name to compute Δ columns against |
+| `prompts` | your `[prompts.*]`, else the first two built-ins | any built-in or `[prompts.*]` name |
+| `baseline` | none | target name to compute Δ columns against (must exist) |
 | `max_tokens_field` | `max_tokens` | use `max_completion_tokens` for GPT-5/o-series |
 | `stream_options` | `true` | send `include_usage`; disable if a provider 400s |
 
@@ -21,7 +21,7 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 
 | Key | Required | Notes |
 |---|---|---|
-| `name` | yes | shows up in reports; keep it stable across runs |
+| `name` | yes | shows up in reports; must be unique (every statistic is keyed by it) — keep it stable across runs |
 | `base_url` | yes | OpenAI-compatible root; `/chat/completions` is appended |
 | `model` | yes | provider's model id, not your alias |
 | `api_key_env` | no* | env var holding the key |
@@ -31,9 +31,13 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `price` | no | `{ in_per_1m, out_per_1m }` for cost columns |
 | `max_tokens_field` | no | per-target override |
 | `stream_options` | no | per-target override |
-| `mock` | no | synthetic profile for `--mock` runs |
+| `mock` | no | synthetic profile, **only used with `--mock`** (see below) |
 
-\* One of them, unless the endpoint is on localhost.
+\* One of them, unless the endpoint is on `localhost` / `127.0.0.1` / `::1`.
+
+`reps`, `concurrency` and `warmup` are validated up front: a config that would
+measure nothing (0 reps, concurrency 0, unknown prompt, duplicate names) is
+rejected before any request is sent.
 
 ## Pinning an upstream
 
@@ -64,7 +68,8 @@ Other routing fields worth knowing: `sort = "throughput" | "latency" | "price"`,
 ## Prompts
 
 Built-ins: `prose-256` (long prose), `code-256` (code generation),
-`long-context` (~7k-token prefill, 128-token output).
+`long-context` (~7k-token prefill, 128-token output). They stay available by name
+when you define your own, so `prompts = ["prose-256", "mine"]` works.
 
 ```toml
 [prompts.summary]
@@ -76,10 +81,12 @@ max_tokens = 128
 text = "Explain TCP congestion control."
 max_tokens = 256
 # document = "inline text"          # or
-# document_file = "docs/big.txt"    # or
+# document_file = "docs/big.txt"    # relative to this config file
 ```
 
 `repeat` is how you build a prefill-heavy prompt without shipping a fixture file.
+An explicit `document`/`document_file` is included once by default (`repeat`
+multiplies it); the built-in filler is only used when `repeat` asks for it.
 
 ## Prices
 
@@ -121,3 +128,16 @@ tps run -c my.toml --mock --reps 1
 
 The report is flagged `MOCK DATA`, and `meta.json` records `"mock": true`. If a
 target's `extra_body` is malformed you'll see it here, not after 400 requests.
+
+## Mock profiles
+
+A `mock` table shapes the synthetic numbers for `--mock` runs. It is **ignored
+without `--mock`** (with a warning), so a leftover profile can never leak fake
+rows into a real measurement; a config where *every* target has one refuses to
+run without `--mock`.
+
+```toml
+mock = { ttft = [0.21, 0.34], itl = [0.007, 0.011], scaling = 0.45 }
+#        TTFT range (s)       chunk-gap range (s)   <1: degrades under load
+mock = { family = 1, noisy = true }   # fingerprint demo: weight family 0–2, self-disagreement
+```

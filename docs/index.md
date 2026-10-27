@@ -1,5 +1,7 @@
 # Documentation
 
+![tps — one model, every provider, measured](assets/banner.svg)
+
 `tps` measures one model across many providers and gateways.
 
 ## Start here
@@ -41,11 +43,8 @@ time-of-day doesn't leak into one row. Then test whether the "same model" is
 actually the same weights. Everything else in these docs is detail about not
 fooling yourself.
 
-## Wiki
+## Where these docs live
 
-The same material is mirrored to the GitHub wiki for browsing. Source of truth is
-[`wiki/`](https://github.com/teal-sea/tps-test/tree/main/wiki) in this repo; publish with:
-
-```bash
-scripts/publish-wiki.sh            # needs Settings -> Features -> Wikis enabled
-```
+`docs/` is the single source of truth. The same pages build into a browsable
+site (`pip install -e ".[docs]" && mkdocs serve`) and are generated into the
+GitHub wiki by `scripts/publish-wiki.sh` — never edited there.

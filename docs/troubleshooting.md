@@ -12,8 +12,10 @@ directory. Either `cd` to where the config is, or pass `-c path/to/file.toml`.
 
 ## `HTTP 400 ... stream_options`
 
-Some OpenAI-compatible servers reject `stream_options`. The rig retries once
-automatically without it. If it still fails, set in the target:
+Some OpenAI-compatible servers reject `stream_options`. `tps` resends that
+request once without it — a compatibility fallback, not a retry of a failure —
+and stops sending it to that target for the rest of the run. To skip the probe
+entirely, set in the target:
 
 ```toml
 stream_options = false
@@ -49,13 +51,20 @@ Check, in this order:
 2. Is `out tok` lower than the other rows? (early stop ⇒ fast-looking)
 3. Is the target pinned, or did the router send you somewhere cheap and different?
 4. Is the quantization different (fp4 vs fp8)?
-5. Did `serve by` show a provider you did not expect?
+5. Did `served by` show a provider you did not expect?
+6. Is `tok/s` marked `≈`? The provider sent no `usage`, so tokens were estimated.
 
 ## Two runs disagree by 30%
 
 Expected. Provider throughput moves with load and time of day. Run both twice,
 same hour, ≥7 reps, and compare medians of medians. Then check whether the
 difference survives.
+
+## I pressed Ctrl-C halfway through
+
+Nothing measured is lost. `raw.jsonl` is written as batches finish, the report
+is rendered from what completed and flagged `PARTIAL`, and the exit code is 130.
+Re-render any time with `tps report runs/<stamp>`.
 
 ## `tps report` says "not a tps run directory"
 
@@ -71,7 +80,13 @@ harder, or accept that speed differences come from serving, not weights.
 
 `self_agreement` < 98% at temperature 0. That endpoint varies run to run — often
 batch-dependent kernels or a router fanning out between backends. Its
-cross-provider numbers are not interpretable; exclude it or investigate.
+cross-provider numbers are not interpretable, so it never decides the verdict;
+exclude it or investigate.
+
+## Fingerprint lists a provider under "no data"
+
+Its request failed (auth, 5xx, timeout — the reason is printed). That is not
+evidence of different weights; fix the error and re-run.
 
 ## Import error: `No module named tps`
 
@@ -83,10 +98,21 @@ Either `pipx install .` from the repo, or `cd` into it.
 They should not appear — colour is disabled when stdout is not a TTY. If a wrapper
 forces a TTY, pass `--no-color` or set `NO_COLOR=1`.
 
-## `error: unrecognized arguments`
+## `error: unrecognized arguments` (exit 1)
 
-Flags must go after the subcommand (`tps run --json`), not between two commands.
-Global flags are accepted in both positions but a typo will not be treated kindly.
+Subcommand flags go after the subcommand (`tps run --reps 3`). Global flags
+(`--json`, `--no-color`, `-q`, `-v`) are accepted in both positions.
+
+## `duplicate target name(s)` (exit 1)
+
+Every statistic is keyed by `name`, so two targets with the same name (or two
+unnamed targets with the same `model`) would be silently pooled. Give each one a
+unique `name`.
+
+## `only defines mock targets — add --mock` (exit 1)
+
+`targets.mock.toml` and `examples/fingerprint-demo.toml` are synthetic demos; run
+them with `--mock`.
 
 ## Still stuck
 
