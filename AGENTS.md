@@ -35,11 +35,24 @@ library API — drive it as a subprocess and parse `--json`.
 ```bash
 tps doctor      [-c FILE] [--network]              # environment + credentials
 tps init        [--model SLUG] [--out FILE] [--force]
+tps init        --endpoint URL --model ID [--api-key-env VAR] [--name N] [--price IN,OUT]
 tps discover    MODEL [--out FILE] [--from-json F] [--json-out F]
-tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b] [--mock]
+tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b]
+                [--max-tokens N] [--temperature T] [--timeout S] [--dry-run] [--mock]
+tps run         --base-url URL --model ID [--api-key-env VAR] [--price IN,OUT] [...]
 tps report      RUN_DIR [--markdown]
-tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--mock]
+tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--timeout S] [--mock]
 ```
+
+`--base-url` measures one OpenAI-compatible endpoint with no config file (not
+with `-c`); the generated config is saved as `<run_dir>/targets.toml` with the
+effective settings (overrides included), and never replaces a different
+`targets.toml` already there (exit 1).
+`--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
+Messages API — the only Anthropic endpoint that accepts subscription/OAuth
+tokens; it sends no `temperature` (Claude 4.7+ 400s on it) and keeps hidden
+thinking out of tok/s. `discover` and `init --model` are OpenRouter-only;
+everything else is not.
 
 Global: `--json`, `--no-color`, `-q`, `-v`, `--version`. May appear before or
 after the subcommand. Config defaults to `targets.toml`, then
@@ -80,23 +93,61 @@ on **stdout** and exit non-zero.
     "concurrency": 1,
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
-    "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
+    "itl_p50_ms": 12.0, "itl_n": 7, "first_content_n": 7,
+    "tokens_per_chunk_median": 1.0, "bursty": 0,
+    "e2e_p50_s": 3.2, "out_tokens_median": 240,
+    "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 35, "n": 35, "errors": {},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {"1": {"ok": 7, "n": 7, "...": "..."}, "4": {"ok": 28, "n": 28, "...": "..."}},
     "count_source": ["usage"], "served_by": ["DeepInfra"],
     "price_in_per_1m": 0.14, "price_out_per_1m": 0.42
   }],
-  "failed": 0, "total": 385, "mock": false,
+  "failed": 0, "total": 385, "warmup_requests": 22, "planned_requests": 407, "mock": false,
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
 ```
+
+Counts: `total` = measured requests; `warmup_requests` were sent first and
+discarded; `planned_requests` = both. `raw.jsonl` rows carry
+`"phase": "warmup"|"measure"`.
+
+`reasoning_only` > 0 means responses had no answer text — usually a reasoning
+model that hit `max_tokens` while thinking (`truncated` counts
+`finish_reason: "length"`, which the built-in prompts reach by design). Then
+`first_content_p50_s`/`itl_p50_ms` are null and TTFT/tok/s time the *thinking*;
+`notes` says so. Re-run with a larger `--max-tokens`; don't report those rates as
+answer speed. Like `ok`/`n`, `truncated` and `reasoning_only` count every
+concurrency level; `by_concurrency` has them per level. `count_source`
+`usage+chars/4` means part of the reasoning was hidden and estimated.
+
+Error classes beyond HTTP/transport: `stream_error`, `incomplete_stream` (Claude
+stream with no `message_stop`), `content_filter`, `refusal`, `no_content`,
+`empty_stream` — none is timed as an answer.
+
+`bursty` > 0 means chunks arrived in clumps (median gap < 20% of the typical
+gap — the mean without its longest 2%), so
+`itl_p50_ms` measures a proxy's flushing, not the model — don't rank providers
+on it. `itl_n` / `first_content_n` give the sample count behind those medians;
+`tokens_per_chunk_median` reconciles ITL with tok/s.
+
+`run --dry-run` sends nothing and adds `dry_run: true`, `plan{requests,
+measured_requests, warmup_requests, in_tokens_est, in_tokens_max, out_tokens_max,
+cost_max_usd, unpriced[], est_minutes, assumed{tok_s, ttft_s, template_tokens},
+targets[]}` and `missing_credentials[]` (exit 0 even when credentials are
+missing). `cost_max_usd` is an upper bound: every response at `max_tokens`, input
+at `in_tokens_max` (UTF-8 bytes + template allowance — chars/4 `in_tokens_est`
+undercounts CJK/code); `null` when no target has a price. `est_minutes` assumes
+the stated rate.
 
 `discover` adds `model`, `endpoints[]`, `config`, `targets`.
 `fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
 `no_data{target: error}`, `noisy[]`, `unmeasured[]`, `distinguishable_groups`,
 `noise_floor_measured`, `self_agreement{}`,
-`pairs[]`, `prompt_tokens{}`.
+`pairs[]`, `prompt_tokens{}`, `reasoning_seen[]`. It requests 20
+`top_logprobs` (5 if capped; all kept in `fingerprints.jsonl`) and turns
+reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
+`no_data` with `reasoning_consumed_budget`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`.
 
 Treat `results[].ok/n` as the reliability signal — they count every concurrency
@@ -109,7 +160,14 @@ always the slow tail**: `out_tps_p90 ≤ out_tps_p50`.
 **"Is provider X actually better?"**
 ```bash
 tps discover <model> --out /tmp/t.toml --json | jq '.endpoints | sort_by(.price_out_per_1m)[:5]'
+tps run -c /tmp/t.toml --reps 7 --dry-run --json | jq '.plan | {requests, cost_max_usd, est_minutes}'
 tps run -c /tmp/t.toml --reps 7 --json | jq '.results | sort_by(-.out_tps_p50) | .[:3] | .[] | {target, out_tps_p50, ttft_p50_s}'
+```
+
+**"How fast is this endpoint?"** (not on OpenRouter)
+```bash
+tps run --base-url https://api.example.com/v1 --model <id> --api-key-env VAR --json \
+  | jq '.results[] | {ttft_p50_s, out_tps_p50, itl_p50_ms, reasoning_only, notes}'
 ```
 
 **"Is the cheap one the same model?"**
@@ -119,13 +177,21 @@ tps fingerprint -c /tmp/t.toml --json | jq '.verdict, .clusters, .no_data'
 
 ## Cost and time
 
-`run` with 11 targets, 1 prompt, 7 reps, concurrency 1 and 4 ≈ 385 requests ≈
-20 min ≈ $0.05 of tokens. `fingerprint` ≈ 44 requests ≈ 1 min. Always estimate
-before running a 41-target config.
+Don't estimate by hand: `tps run … --dry-run --json` returns the request count,
+worst-case cost and rough minutes for exactly the flags you pass. For scale: 11
+targets, 1 prompt, 7 reps, concurrency 1 and 4 = 385 measured + 22 warm-up
+requests ≈ 20 min, ≤ $0.10 worst case (≈ $0.05 in practice). `fingerprint` ≈ 44
+requests ≈ 1 min. Always dry-run a 41-target config first.
 
 ## Failure modes you will hit
 
-- `missing credentials` (2) — the env var in `api_key_env` isn't set.
+- `missing credentials` (2) — the env var in `api_key_env` (`--api-key-env`) isn't set.
+- A row with `reasoning_only == ok` — the model never answered inside
+  `max_tokens`; see above. Claude Opus 5.5 does this at the built-in 256-token
+  cap: use `--max-tokens 2048`.
+- `http_400 … temperature` on Claude — the target is on the OpenAI-compatible
+  layer; use `--api anthropic`, or `--temperature omit`.
+- `extra_body can't set …` (1) — token caps come from prompts / `--max-tokens`.
 - `HTTP 404` on a pin — the provider slug is wrong or the model moved; re-run `discover`.
 - Everything timing out — check egress/proxy; `tps doctor --network`.
 - Mock data — `"mock": true` in `meta.json`; never report it as a measurement.

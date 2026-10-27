@@ -19,6 +19,15 @@ For reasoning models the report adds a **first answer** column: time to the firs
 *content* chunk, i.e. when a user would see the answer start. It only appears
 when it differs from TTFT.
 
+A reasoning model can spend its entire `max_tokens` thinking and never answer
+(`finish_reason: "length"`, no content chunks). If the thinking streamed, its
+TTFT and tok/s are real measurements *of the thinking*; if it was hidden (Claude),
+nothing streamed at all. Either way first answer and ITL have nothing to time,
+and the request still counts as `ok` — it is a result, not an empty stream.
+`tps` counts these responses (`reasoning_only`, next to `truncated` for any
+response stopped by the cap) and says so under the table — *measured thinking,
+not answering* — instead of leaving a bare `—`. Raise `--max-tokens`.
+
 TTFT includes your DNS, TLS, network RTT, queueing, and prefill. It is therefore a
 measure of *your* experience, not a property of the model alone.
 
@@ -37,7 +46,21 @@ terrible ITL, or the reverse.
 Caveat: many providers coalesce several tokens into one SSE chunk. A chunk is not
 a token, so ITL here is really "chunk inter-arrival", which is what a user
 perceives anyway. It is not comparable to a per-token ITL measured from raw
-logits.
+logits. **tok/chunk** (`tokens_per_chunk_median`) says how many tokens each chunk
+carried, which is what reconciles the two: 3.7 tokens/chunk every 20 ms is
+~180 tok/s.
+
+**Bursts.** A proxy or gateway that buffers the stream can deliver chunks in
+clumps — many arriving back to back, then a pause. The median gap then lands
+inside a clump (≈1 ms) and describes the proxy's flushing, not the model: 1 ms
+ITL next to 138 tok/s is not a contradiction you should resolve by believing
+either. `tps` flags a request as **bursty** when its median gap is under 20% of
+its typical gap (the mean with the longest 2% — at least two — left out, so a
+single stall isn't called a burst) — a comparison of the stream with itself, so
+it needs no token counts. Bursty rows are marked `†`, never win "best ITL", carry a note, and are
+counted in `bursty` (with `itl_n`, the number of requests the ITL median came
+from). No client-side measurement can recover the model's pacing from a
+coalesced stream.
 
 ## tok/s — per-stream decode rate
 
@@ -80,8 +103,13 @@ table's concurrency. In `--json` results, top-level `ok`/`n`/`errors` count
 is the reliability signal — and `by_concurrency` breaks it down per level.
 
 Errors are classified (`rate_limited`, `timeout`, `http_<status>`, `transport`,
-`stream_error`, `empty_stream`) and counted in the Failures table. `stream_error`
-means the provider started streaming and then sent an error object mid-stream.
+`stream_error`, `incomplete_stream`, `content_filter`, `refusal`, `no_content`,
+`empty_stream`) and counted in the Failures table. `stream_error` means the
+provider started streaming and then sent an error object mid-stream;
+`incomplete_stream` is a Claude stream that ended without `message_stop` (cut
+off — its counts can't be trusted); `content_filter` / `refusal` are declines,
+never timed as answers; `no_content` is a billed response with nothing streamed
+that wasn't reasoning hitting the cap.
 
 There are no retries: a 429 at concurrency 16 is information.
 
@@ -129,7 +157,10 @@ per-request column.
 - **Prompt-cache effects** — each request uses the same prompt, so cache hits are
   included if the provider does them. That is realistic for repeated workloads but
   flattering for first-call latency.
-- **Hidden reasoning** — if a provider counts reasoning tokens in `usage` without
-  streaming them, tok/s is inflated for that row. Compare reasoning models with
-  care.
+- **Hidden reasoning** — when a provider bills reasoning it doesn't stream and
+  reports how much (`completion_tokens_details.reasoning_tokens`, or the Claude
+  API's `output_tokens_details.thinking_tokens`), those tokens are kept out of
+  tok/s and recorded as `hidden_reasoning_tokens`; the row notes that TTFT
+  includes them. A provider that hides reasoning *without* reporting it still
+  inflates tok/s, and nothing in the stream can reveal it.
 - **Tool calling, JSON mode, vision** — chat text only.

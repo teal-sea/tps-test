@@ -2,7 +2,7 @@
 
 # Fingerprint: same weights or just the same name?
 
-Greedy decode (temp 0). `self` = the provider's agreement with itself across reps — its noise floor. Agreement below that floor is not evidence of different weights.
+Greedy decode (temp 0) where the API allows it, reasoning off where it can be turned off. `self` = the provider's agreement with itself across reps — its noise floor. Agreement below that floor is not evidence of different weights.
 
 ## Tokenizer & chat-template signature
 

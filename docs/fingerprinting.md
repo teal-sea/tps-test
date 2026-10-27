@@ -12,7 +12,12 @@ tps fingerprint -c targets.toml
 ## How it works
 
 1. Every target is sent the same prompt **twice**, at `temperature = 0`,
-   non-streaming, with `logprobs` and `top_logprobs`.
+   non-streaming, with `logprobs` and 20 `top_logprobs` (5 where a provider caps
+   it; every alternative is kept in `fingerprints.jsonl`). On OpenRouter,
+   reasoning is turned off — it makes traces longer and noisier and can spend
+   the whole budget. Targets that reasoned anyway (billed `reasoning_tokens`) are
+   listed as `reasoning_seen`; one that spent the whole budget reasoning is
+   `no_data` with `reasoning_consumed_budget` and a hint, not "different weights".
 2. Each target's two runs are compared with each other — that's its **noise
    floor**. Batching and kernel nondeterminism mean no endpoint is bit-exact
    across calls.
@@ -22,7 +27,8 @@ tps fingerprint -c targets.toml
    weights and kernels reproduce the same tokens; fp4 vs fp8 diverges within a few
    dozen tokens; a distilled model diverges almost immediately.
 5. Cheap independent check: `usage.prompt_tokens` for the same input string. Same
-   tokenizer and chat template ⇒ same count.
+   tokenizer and chat template ⇒ same count. It describes the input, so it is read
+   from any response that reported it, including one whose completion failed.
 
 ## Reading the output
 
@@ -53,6 +59,11 @@ high (≥ 98% self-agreement) can move the verdict. Three kinds never do:
 - a target with **no measured floor** — `unmeasured`: its second rep failed, or
   the run used `--reps 1`. With `--reps 1` nobody has a floor, so the verdict is
   always `inconclusive`.
+
+Groups are formed from deterministic targets alone. A `noisy` or `unmeasured`
+target is then shown in the one group it matches; if it matches two, it gets a
+group of its own rather than merging them, so it can't turn a `split` into
+`consistent`.
 
 ![tps fingerprint output — demo data](assets/screenshot-fingerprint.svg)
 

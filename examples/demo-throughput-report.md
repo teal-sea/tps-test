@@ -2,18 +2,18 @@
 
 > **MOCK DATA** — synthetic numbers from `--mock`. Not a measurement; never publish them.
 
-- model: `demo-model` · reps 7 · concurrency [1, 4] · temp 0.0 · http2 True
+- model: `demo-model` · reps 7 · concurrency [1, 4] · temp 0 · max_tokens 256 · http2 True
 - captured: (demo run — regenerate with scripts/render_assets.py)
 
-TTFT = time to the first generated token (content or reasoning). tok/s = per-stream decode rate across the streaming window. ITL = median gap between content chunks. **p90 is always the slow tail** (for tok/s, the rate 90% of requests met or beat). Aggregate = all tokens of a concurrent batch ÷ its wall clock. Definitions: `docs/metrics.md`.
+TTFT = time to the first generated token (content or reasoning). tok/s = per-stream decode rate across the streaming window. ITL = median gap between content chunks; tok/chunk shows how many tokens each chunk carried, and † marks streams that arrived in bursts, where ITL reflects flushing rather than the model. **p90 is always the slow tail** (for tok/s, the rate 90% of requests met or beat). Aggregate = all tokens of a concurrent batch ÷ its wall clock. Definitions: `docs/metrics.md`.
 
 ## `prose-256` — single stream
 
-| provider | TTFT p50 | TTFT p90 | tok/s p50 | tok/s p90 | ITL p50 ms | E2E p50 | out tok | ok | Δ TTFT vs mid-provider | Δ tok/s vs mid-provider |
-|---|---|---|---|---|---|---|---|---|---|---|
-| fast-provider | 0.32 | 0.34 | 99.7 | 94.3 | 10.0 | 2.54 | 242 | 7/7 | -0.13s | +89% |
-| mid-provider | 0.45 | 0.60 | 52.8 | 49.0 | 18.9 | 4.98 | 231 | 7/7 | — | — |
-| slow-provider | 1.13 | 1.28 | 29.3 | 26.8 | 34.1 | 9.40 | 244 | 7/7 | +0.69s | -45% |
+| provider | TTFT p50 | TTFT p90 | tok/s p50 | tok/s p90 | ITL p50 ms | tok/chunk | E2E p50 | out tok | ok | Δ TTFT vs mid-provider | Δ tok/s vs mid-provider |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fast-provider | 0.32 | 0.34 | 99.7 | 94.3 | 10.0 | 1.0 | 2.54 | 242 | 7/7 | -0.13s | +89% |
+| mid-provider | 0.45 | 0.60 | 52.8 | 49.0 | 18.9 | 1.0 | 4.98 | 231 | 7/7 | — | — |
+| slow-provider | 1.13 | 1.28 | 29.3 | 26.8 | 34.1 | 1.0 | 9.40 | 244 | 7/7 | +0.69s | -45% |
 
 ```
 fast-provider  ████████████████████████████    99.7 tok/s
