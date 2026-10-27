@@ -72,7 +72,10 @@ with synthetic numbers, instantly and offline.
 | [Troubleshooting](docs/troubleshooting.md) | the errors you will actually hit |
 | [FAQ](docs/faq.md) | short answers |
 
-Wiki (narrative versions of the same): <https://github.com/teal-sea/tps-test/wiki>
+**Wiki**: <https://github.com/teal-sea/tps-test/wiki> — the same material in
+browsable form. If the wiki is empty, enable *Settings → Features → Wikis* and run
+`scripts/publish-wiki.sh` (content lives in [`wiki/`](wiki/), so it's reviewable and
+versioned with the code).
 
 Building an agent on top? Read [AGENTS.md](AGENTS.md) instead — it's the same
 contracts in a denser form.

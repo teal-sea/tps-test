@@ -40,3 +40,12 @@ latency, decode rate, aggregate throughput, failures and cost — interleaved so
 time-of-day doesn't leak into one row. Then test whether the "same model" is
 actually the same weights. Everything else in these docs is detail about not
 fooling yourself.
+
+## Wiki
+
+The same material is mirrored to the GitHub wiki for browsing. Source of truth is
+[`wiki/`](../wiki) in this repo; publish with:
+
+```bash
+scripts/publish-wiki.sh            # needs Settings -> Features -> Wikis enabled
+```
