@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 import sys
@@ -249,12 +251,12 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
         Col("ttft"),
         Col("tok/s"),
         Col("", "l", flex=True),
-        Col("itl"),
+        Col("itl", drop=1),
         Col("ok"),
-        Col("$/1M out"),
+        Col("$/1M out", drop=2),
     ]
     if show_delta:
-        cols += [Col("Δ ttft"), Col("Δ tok/s")]
+        cols += [Col("Δ ttft", drop=3), Col("Δ tok/s", drop=4)]
 
     estimated = False
     table = []
@@ -450,10 +452,15 @@ def print_fingerprint(
                 ui.say(f"      {ui.grey(f'{count:>5} tok' if i == 0 else ' ' * 9)}  {line}")
 
     noisy = set(summary["noisy"])
+    unweighed = noisy | set(summary["unmeasured"])
     digits = len(str(max((len(g) for g in summary["clusters"]), default=1)))
     for index, group in enumerate(summary["clusters"]):
         colour = ui.group(index)
-        tag = " (non-deterministic — can't be placed)" if all(t in noisy for t in group) else ""
+        tag = (
+            " (no deterministic noise floor — can't be placed)"
+            if all(t in unweighed for t in group)
+            else ""
+        )
         lines = _wrap(", ".join(group) + tag, ui.width - 22)
         label = f"group {index + 1}"
         count = ui.grey(f"({len(group):>{digits}})")
@@ -469,13 +476,18 @@ def print_fingerprint(
         ui.say(
             f"  {ui.yellow('~')} {ui.grey('noisy')}    {target} {ui.grey(f'— self-agreement {value * 100:.0f}%')}"
         )
-    if not summary["noise_floor_measured"]:
-        ui.warn("noise floor not measured (needs --reps 2) — treat agreement as indicative")
+    if summary["noise_floor_measured"]:
+        for target in summary["unmeasured"]:
+            ui.say(
+                f"  {ui.yellow('?')} {ui.grey('no floor')} {target} {ui.grey('— second rep failed; not weighed')}"
+            )
+    else:
+        ui.warn("noise floor not measured — needs two successful reps per provider (--reps 2)")
 
     ui.say()
     verdict = summary["verdict"]
     if verdict == "split":
-        firm = len([g for g in summary["clusters"] if any(t not in noisy for t in g)])
+        firm = summary["distinguishable_groups"]
         ui.say(
             f"  {ui.badge('SPLIT', 'warn')} {firm} distinguishable groups — not the same artifact."
         )
@@ -487,8 +499,8 @@ def print_fingerprint(
         )
     else:
         ui.say(
-            f"  {ui.badge('INCONCLUSIVE', 'muted')} fewer than two deterministic providers "
-            "returned data."
+            f"  {ui.badge('INCONCLUSIVE', 'muted')} fewer than two providers with a measured, "
+            "deterministic noise floor."
         )
 
 
@@ -669,7 +681,7 @@ def cmd_discover(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             Col("$/1M in"),
             Col("$/1M out"),
             Col("", "l", flex=True),
-            Col("ctx"),
+            Col("ctx", drop=1),
         ],
         table,
         title=f"{canonical} · sorted by output price",
@@ -835,17 +847,26 @@ def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     )
 
     with Progress(ui, total) as progress:
-        report, prints, summary = core.run_fingerprint(
-            cfg,
-            outdir,
-            args.max_tokens,
-            args.reps,
-            prompt_count,
-            args.mock,
-            on_progress=lambda **kw: progress.update(
-                kw["done"], f"{kw['target']} · {kw['prompt']} · rep {kw['rep'] + 1}"
-            ),
-        )
+        try:
+            report, prints, summary = core.run_fingerprint(
+                cfg,
+                outdir,
+                args.max_tokens,
+                args.reps,
+                prompt_count,
+                args.mock,
+                on_progress=lambda **kw: progress.update(
+                    kw["done"], f"{kw['target']} · {kw['prompt']} · rep {kw['rep'] + 1}"
+                ),
+            )
+        except KeyboardInterrupt:
+            progress.close()
+            path = outdir / "fingerprints.jsonl"
+            kept = len(path.read_text().splitlines()) if path.exists() else 0
+            raise Interrupted(
+                f"interrupted — {kept} fingerprint(s) kept in {outdir}"
+                + (f"; partial report at {outdir}/fingerprint.md" if kept else "")
+            ) from None
 
     targets = [t.name for t in cfg.targets]
     print_fingerprint(ui, summary, prints, targets)
@@ -989,15 +1010,32 @@ def _main(argv: list[str] | None) -> int:
     _safe_streams()
     parser = build_parser()
     want_json = "--json" in argv
+    command = next((a for a in argv if a in COMMANDS), None)
+    captured = io.StringIO()
     try:
-        args = parser.parse_args(argv)
+        # in --json mode, --help/--version text is wrapped in the one JSON object
+        with contextlib.redirect_stdout(captured) if want_json else contextlib.nullcontext():
+            args = parser.parse_args(argv)
     except core.UsageError as exc:
         ui = UI(json_mode=want_json, color=False if "--no-color" in argv else None)
         if want_json:
-            ui.emit(_error_payload(None, exc.exit_code, str(exc)))
+            ui.emit(_error_payload(command, exc.exit_code, str(exc)))
         else:
             ui.error(str(exc))
         return exc.exit_code
+    except SystemExit as exc:  # --help / --version
+        if want_json:
+            payload: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "command": command,
+                "ok": True,
+            }
+            if "--version" in argv:
+                payload["version"] = __version__
+            else:
+                payload["help"] = captured.getvalue()
+            UI(json_mode=True).emit(payload)
+        return int(exc.code or 0)
 
     if not args.command:
         if args.json:

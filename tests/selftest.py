@@ -72,9 +72,10 @@ class Handler(BaseHTTPRequestHandler):
         model = body.get("model", "")
 
         if model == "echo-key":  # some providers echo the submitted key in errors
-            self._json(
-                401, {"error": {"message": f"invalid key: {self.headers.get('Authorization')}"}}
-            )
+            # header key near the start; the bearer key straddles the 600-char cut
+            auth = self.headers.get("Authorization")
+            message = f"hdr={self.headers.get('x-api-key')} " + "x" * 523 + f" invalid: {auth}"
+            self._json(401, {"error": {"message": message}})
             return
         if self.headers.get("Authorization") == "Bearer bad-key":
             self._json(429, {"error": {"message": "rate limited", "code": 429}})
@@ -181,6 +182,8 @@ class Handler(BaseHTTPRequestHandler):
         if model == "fp-fail":
             self._json(500, {"error": {"message": "upstream down"}})
             return
+        if model == "fp-slow":
+            time.sleep(0.4)
         if model == "text-only-model" and body.get("logprobs"):
             self._json(
                 400,
@@ -231,8 +234,10 @@ def serve() -> tuple[Server, str]:
     return server, f"http://127.0.0.1:{server.server_port}/v1"
 
 
-def tps(args: list[str], cwd: Path, timeout: float = 120) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(ROOT), "NO_COLOR": "1"}
+def tps(
+    args: list[str], cwd: Path, timeout: float = 120, env_extra: dict | None = None
+) -> subprocess.CompletedProcess:
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "NO_COLOR": "1", **(env_extra or {})}
     return subprocess.run(
         [sys.executable, "-m", "tps", *args],
         cwd=cwd,
@@ -332,12 +337,17 @@ async def main() -> int:
                 str(denied.error),
             )
 
-            echoed = await once(tgt("echo-key", api_key="sk-selftest-secret-123456"))
+            echoed = await once(
+                tgt(
+                    "echo-key",
+                    api_key="sk-selftest-secret-123456",
+                    headers={"x-api-key": "sk-header-SECRET-0123456789"},
+                )
+            )
             check(
-                "echoed API key is redacted from errors",
-                "sk-selftest-secret-123456" not in (echoed.error or "")
-                and "[redacted]" in (echoed.error or ""),
-                str(echoed.error),
+                "echoed keys redacted (header keys, and across the truncation cut)",
+                "sk-" not in (echoed.error or "") and "[redacted]" in (echoed.error or ""),
+                str(echoed.error)[-120:],
             )
 
             print("timeout handling:")
@@ -359,11 +369,13 @@ async def main() -> int:
                 str(midstream.error),
             )
             big = await once(tgt("big-chunks"))
-            truth = 7 * BIG_CHUNK / (7 * BIG_DELAY)  # tokens after the first chunk / window
+            # exact, timing-independent: the window is credited with the 7 chunks
+            # that arrived inside it (224 tokens), not all 256
+            credited = big.out_tps * big.decode_s if big.out_tps and big.decode_s else None
             check(
                 "big chunks: first chunk not credited to the window",
-                big.out_tps is not None and abs(big.out_tps - truth) / truth < 0.12,
-                f"{big.out_tps} vs {truth:.0f}",
+                credited is not None and abs(credited - 7 * BIG_CHUNK) < 1,
+                f"credited {credited} tokens, expected {7 * BIG_CHUNK}",
             )
             reasoning = await once(tgt("reasoning"))
             check("reasoning: ok", reasoning.ok, str(reasoning.error))
@@ -497,6 +509,29 @@ async def main() -> int:
         )
         none = core.fingerprint_summary(failed_prints, ["down"], ["p"])
         check("all failed -> inconclusive", none["verdict"] == "inconclusive", none["verdict"])
+        one_rep = core.fingerprint_summary(
+            [
+                core.Fingerprint("a", "p", 0, True, tokens=a0.tokens),
+                core.Fingerprint("b", "p", 0, True, tokens=b0.tokens),
+            ],
+            ["a", "b"],
+            ["p"],
+        )
+        check(
+            "no noise floor (--reps 1) -> inconclusive, never split",
+            one_rep["verdict"] == "inconclusive" and not one_rep["noise_floor_measured"],
+            one_rep["verdict"],
+        )
+        second_failed = same + [
+            core.Fingerprint("c", "p", 0, True, tokens=b0.tokens, text=b0.text),
+            core.Fingerprint("c", "p", 1, False, error="rate_limited: 429"),
+        ]
+        partial = core.fingerprint_summary(second_failed, ["a", "b", "c"], ["p"])
+        check(
+            "target without a floor is unmeasured and can't force a split",
+            partial["verdict"] == "consistent" and partial["unmeasured"] == ["c"],
+            f"{partial['verdict']} {partial['unmeasured']} {partial['clusters']}",
+        )
 
         print("discover (offline fixture):")
         fixture = ROOT / "tests" / "fixtures" / "openrouter-endpoints.sample.json"
@@ -572,6 +607,15 @@ async def main() -> int:
         meta = json.loads((work / "out" / "meta.json").read_text())
         check("meta records completion", meta.get("complete") is True, str(meta.get("complete")))
 
+        narrow = tps(["report", "out"], work, env_extra={"COLUMNS": "50"})
+        widest = max(
+            (len(line) for line in narrow.stdout.splitlines() if line[:1] in "│╭├╰"), default=0
+        )
+        check(
+            "narrow terminal: tables fit by hiding optional columns",
+            widest <= 50,
+            f"widest line {widest}",
+        )
         report_run = tps(["report", "out"], work)
         check(
             "report re-renders",
@@ -588,6 +632,17 @@ async def main() -> int:
         bad_flag = tps(["run", "--json", "--reps", "abc"], work)
         check("bad flag exits 1 (not 2)", bad_flag.returncode == 1, str(bad_flag.returncode))
         check("bad flag still emits JSON", '"ok": false' in bad_flag.stdout, bad_flag.stdout[:120])
+        check(
+            "JSON error names the command",
+            json.loads(bad_flag.stdout or "{}").get("command") == "run",
+            bad_flag.stdout[:200],
+        )
+        version = tps(["--json", "--version"], work)
+        check(
+            "--json --version is a JSON object",
+            json.loads(version.stdout or "{}").get("version") is not None,
+            version.stdout[:80],
+        )
         no_cmd = tps(["--json"], work)
         check(
             "--json with no command is an error object",
@@ -605,6 +660,31 @@ async def main() -> int:
         (work / "dup.toml").write_text(
             target_block("same", base, "test-model") + target_block("same", base, "other-model"),
             encoding="utf-8",
+        )
+        (work / "typed.toml").write_text(
+            '[run]\nprompts = "prose-256"\n\n'
+            + target_block(
+                "t", base, "test-model", 'price = { in_per_1m = "0.14", out_per_1m = 0.42 }'
+            ),
+            encoding="utf-8",
+        )
+        typed = core.load_config(work / "typed.toml")
+        check(
+            "quoted price and a string `prompts` are accepted",
+            typed.targets[0].price_in == 0.14 and list(typed.prompts) == ["prose-256"],
+            f"{typed.targets[0].price_in} {list(typed.prompts)}",
+        )
+        (work / "badprice.toml").write_text(
+            target_block(
+                "t", base, "test-model", 'price = { in_per_1m = "cheap", out_per_1m = 1 }'
+            ),
+            encoding="utf-8",
+        )
+        bad_price = tps(["run", "-c", "badprice.toml"], work)
+        check(
+            "non-numeric price rejected before any request",
+            bad_price.returncode == 1 and "number" in bad_price.stderr,
+            bad_price.stderr[-200:],
         )
         dup = tps(["run", "-c", "dup.toml"], work)
         check(
@@ -721,6 +801,71 @@ async def main() -> int:
         check(
             "partial report written and flagged",
             partial_report.exists() and "PARTIAL" in partial_report.read_text(),
+        )
+        (work / "fp_slow.toml").write_text(
+            '[run]\nprompts = ["prose-256"]\n\n' + target_block("slow", base, "fp-slow"),
+            encoding="utf-8",
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tps",
+                "fingerprint",
+                "-c",
+                "fp_slow.toml",
+                "-o",
+                "fpartial",
+                "--reps",
+                "30",
+            ],
+            cwd=work,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        fp_path = work / "fpartial" / "fingerprints.jsonl"
+        deadline = time.time() + 30
+        while time.time() < deadline and (not fp_path.exists() or fp_path.stat().st_size == 0):
+            time.sleep(0.1)
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=30)
+        kept_fp = (
+            [line for line in fp_path.read_text().splitlines() if line.strip()]
+            if fp_path.exists()
+            else []
+        )
+        fp_md = work / "fpartial" / "fingerprint.md"
+        check(
+            "fingerprint ctrl-c: exits 130, keeps data, partial report",
+            proc.returncode == 130
+            and len(kept_fp) >= 1
+            and fp_md.exists()
+            and "PARTIAL" in fp_md.read_text(),
+            f"{proc.returncode} {len(kept_fp)}",
+        )
+
+        print("report provenance:")
+        (work / "unknown_rate.toml").write_text(
+            '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("single", base, "single-chunk")
+            + target_block("down", base, "test-model", 'api_key = "bad-key"'),
+            encoding="utf-8",
+        )
+        tps(["run", "-c", "unknown_rate.toml", "-o", "ur"], work)
+        ur_report = (work / "ur" / "report.md").read_text(encoding="utf-8")
+        chart = [line for line in ur_report.splitlines() if line.startswith("single ")]
+        check("unknown rate shows as —, not 0.0", bool(chart) and "— tok/s" in chart[0], str(chart))
+        cost_section = ur_report.split("## Cost & provenance", 1)[-1]
+        cost_row = next(
+            (line for line in cost_section.splitlines() if line.startswith("| down |")), ""
+        )
+        check(
+            "an all-failed target claims no token source",
+            cost_row.rstrip(" |").endswith("—"),
+            cost_row,
         )
     finally:
         server.shutdown()

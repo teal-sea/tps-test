@@ -66,9 +66,18 @@ class ProviderError(TpsError):
 USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
 
 
-def redact(text: str, secret: str) -> str:
-    """Providers sometimes echo the submitted key in error bodies; never store it."""
-    return text.replace(secret, "[redacted]") if secret and len(secret) >= 8 else text
+SECRET_HEADER_HINTS = ("key", "token", "auth", "secret", "password")
+
+
+def redact(text: str, secrets: str | list[str]) -> str:
+    """Providers sometimes echo the submitted key in error bodies; never store it.
+
+    Redact the *full* text before truncating it, so a key that straddles the
+    cut can't leave its prefix behind."""
+    for secret in [secrets] if isinstance(secrets, str) else secrets:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "[redacted]")
+    return text
 
 
 def now_iso() -> str:
@@ -201,6 +210,15 @@ class Target:
                 return value
         return ""
 
+    def secrets(self) -> list[str]:
+        """The API key plus any credential-looking header values (x-api-key, …)."""
+        values = [self.key()]
+        for name, value in self.headers.items():
+            if isinstance(value, str) and any(h in name.lower() for h in SECRET_HEADER_HINTS):
+                values.append(value)
+                values.append(value.removeprefix("Bearer ").strip())
+        return [v for v in values if v]
+
     def needs_key(self) -> bool:
         """True when a real request would go out unauthenticated to a remote host."""
         return not self.key() and not is_local(self.base_url)
@@ -251,6 +269,26 @@ def validate(cfg: RunConfig, where: str = "config") -> None:
         )
 
 
+def _table(entry: dict[str, Any], key: str, label: str, path: Path) -> dict[str, Any]:
+    value = entry.get(key) or {}
+    if not isinstance(value, dict):
+        raise UsageError(f"{path}: {label}: `{key}` must be a table, e.g. {key} = {{ … }}")
+    return value
+
+
+def _price(value: Any, key: str, label: str, path: Path) -> float | None:
+    """USD per 1M tokens; a quoted number is accepted, anything else is an error
+    now rather than a crash after every request has been sent."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise UsageError(f"{path}: {label}: `{key}` must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise UsageError(f"{path}: {label}: `{key}` must be a number, got {value!r}") from None
+
+
 def load_config(path: Path) -> RunConfig:
     try:
         with open(path, "rb") as handle:
@@ -269,7 +307,7 @@ def load_config(path: Path) -> RunConfig:
         for key in ("base_url", "model"):
             if not entry.get(key):
                 raise UsageError(f"{path}: {label} is missing `{key}`")
-        price = entry.get("price", {}) or {}
+        price = _table(entry, "price", label, path)
         targets.append(
             Target(
                 name=str(entry.get("name") or entry["model"]),
@@ -277,13 +315,13 @@ def load_config(path: Path) -> RunConfig:
                 model=entry["model"],
                 api_key_env=entry.get("api_key_env"),
                 api_key=entry.get("api_key"),
-                headers=entry.get("headers", {}) or {},
-                extra_body=entry.get("extra_body", {}) or {},
-                price_in=price.get("in_per_1m"),
-                price_out=price.get("out_per_1m"),
+                headers=_table(entry, "headers", label, path),
+                extra_body=_table(entry, "extra_body", label, path),
+                price_in=_price(price.get("in_per_1m"), "price.in_per_1m", label, path),
+                price_out=_price(price.get("out_per_1m"), "price.out_per_1m", label, path),
                 max_tokens_field=entry.get("max_tokens_field"),
                 send_stream_options=bool(entry.get("stream_options", True)),
-                mock=entry.get("mock"),
+                mock=_table(entry, "mock", label, path) if "mock" in entry else None,
             )
         )
 
@@ -308,6 +346,8 @@ def load_config(path: Path) -> RunConfig:
         available[name] = merged
 
     selected = run.get("prompts") or list(prompt_table) or list(DEFAULT_PROMPTS)[:2]
+    if isinstance(selected, str):
+        selected = [selected]
     missing = [n for n in selected if n not in available]
     if missing:
         raise UsageError(f"{path}: unknown prompt(s) {missing}; have {sorted(available)}")
@@ -452,7 +492,7 @@ async def stream_once(
             sample.status = response.status_code
             if response.status_code >= 400:
                 raw = await response.aread()
-                snippet = redact(raw[:600].decode("utf-8", "replace").strip(), key)
+                snippet = redact(raw.decode("utf-8", "replace"), target.secrets())[:600].strip()
                 # Some OpenAI-compatible servers reject stream_options outright.
                 # That is a compatibility issue, not a performance result: resend
                 # without it, and remember so later requests skip the doomed one.
@@ -499,7 +539,7 @@ async def stream_once(
                     # gateways report mid-stream upstream failures in-band
                     err = obj["error"]
                     message = err.get("message") if isinstance(err, dict) else err
-                    stream_error = redact(f"stream_error: {str(message)[:300]}", key)
+                    stream_error = redact(f"stream_error: {message}", target.secrets())[:300]
                     break
                 if isinstance(obj.get("usage"), dict):
                     usage = obj["usage"]
@@ -534,7 +574,7 @@ async def stream_once(
         sample.e2e_s = time.perf_counter() - t0
         return sample
     except (httpx.HTTPError, OSError) as exc:
-        sample.error = redact(f"transport: {type(exc).__name__}: {exc}", key)
+        sample.error = redact(f"transport: {type(exc).__name__}: {exc}", target.secrets())
         sample.e2e_s = time.perf_counter() - t0
         return sample
 
@@ -897,13 +937,13 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
         total = totals.setdefault((s["prompt"], s["target"]), {"ok": 0, "n": 0, "errors": {}})
         bucket["n"] += 1
         total["n"] += 1
-        bucket["served"].add(s.get("served_by"))
-        bucket["count_source"].add(s.get("count_source"))
         bkey = (*key, s["batch"])
         batch_wall[bkey] = max(batch_wall.get(bkey, 0.0), s.get("batch_wall_s") or 0.0)
         if s.get("ok"):
             bucket["ok"] += 1
             total["ok"] += 1
+            bucket["served"].add(s.get("served_by"))
+            bucket["count_source"].add(s.get("count_source"))
             for name, source in _FIELDS:
                 bucket[name].append(s.get(source))
             batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s.get("out_tokens") or 0)
@@ -1104,11 +1144,12 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
         lines.append("```")
         width = max((len(t) for t, _b in rows), default=10)
         for target, bucket in rows:
-            rate = p50(bucket["tps"]) or 0
+            rate = p50(bucket["tps"])
             extra = ""
             if bucket["errors"]:
                 extra = "  " + " ".join(f"[{k}×{v}]" for k, v in bucket["errors"].items())
-            lines.append(f"{target:<{width}}  {bar(rate, peak):<28} {rate:7.1f} tok/s{extra}")
+            shown = "      — tok/s" if rate is None else f"{rate:7.1f} tok/s"
+            lines.append(f"{target:<{width}}  {bar(rate or 0, peak):<28} {shown}{extra}")
         lines.append("```")
         lines.append("")
 
@@ -1591,21 +1632,21 @@ async def fingerprint_once(
     try:
         response = await client.post(target.url(), json=body, headers=headers)
         if response.status_code >= 400:
-            text = response.text[:600]
+            text = redact(response.text, target.secrets())[:600]
             if use_logprobs and response.status_code in (400, 422) and "logprob" in text.lower():
                 # provider doesn't implement logprobs; exact-text mode still
                 # detects "different model" but not "same model, different quant"
                 return await fingerprint_once(
                     client, target, prompt_text, prompt_name, max_tokens, cfg, rep, False
                 )
-            result.error = redact(f"http_{response.status_code}: {text}", key)
+            result.error = f"http_{response.status_code}: {text}"
             return result
         payload = response.json()
     except httpx.TimeoutException:
         result.error = "timeout"
         return result
     except (httpx.HTTPError, OSError) as exc:
-        result.error = redact(f"transport: {type(exc).__name__}: {exc}", key)
+        result.error = redact(f"transport: {type(exc).__name__}: {exc}", target.secrets())
         return result
     except ValueError:
         result.error = "non_json_response"
@@ -1758,10 +1799,13 @@ def fingerprint_summary(
             continue
         attempts = [f for f in prints if f.target == target and f.prompt == prompt]
         no_data[target] = next((f.error for f in attempts if f.error), "no response")
-    noisy = [t for t in present if self_agree.get(t, 1.0) < NOISE_FLOOR]
+    # Only a target whose noise floor was *measured* and is high can weigh in.
+    # No floor (one rep, or its second rep failed) is unknown, not deterministic.
+    noisy = [t for t in present if t in self_agree and self_agree[t] < NOISE_FLOOR]
+    unmeasured = [t for t in present if t not in self_agree]
+    deterministic = [t for t in present if t in self_agree and self_agree[t] >= NOISE_FLOOR]
     clusters = cluster_targets(prints, targets, prompt, self_agree)
-    firm_groups = [g for g in clusters if any(t not in noisy for t in g)]
-    deterministic = [t for t in present if t not in noisy]
+    firm_groups = [g for g in clusters if any(t in deterministic for t in g)]
     if len(deterministic) < 2:
         verdict = "inconclusive"
     elif len(firm_groups) > 1:
@@ -1785,6 +1829,8 @@ def fingerprint_summary(
         "clusters": clusters,
         "no_data": no_data,
         "noisy": noisy,
+        "unmeasured": unmeasured,
+        "distinguishable_groups": len(firm_groups),
         "noise_floor_measured": bool(self_agree),
         "self_agreement": {k: round(v, 4) for k, v in self_agree.items()},
         "self_first_divergence": {k: f for k, (_v, f) in selfs.items()},
@@ -1924,10 +1970,11 @@ def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: 
     # 4. clusters + verdict
     lines.append("## Clusters")
     lines.append("")
+    unweighed = set(summary["noisy"]) | set(summary["unmeasured"])
     for index, members in enumerate(summary["clusters"], start=1):
         note = (
-            " — non-deterministic, can't be placed"
-            if all(m in summary["noisy"] for m in members)
+            " — no deterministic noise floor, can't be placed"
+            if all(m in unweighed for m in members)
             else ""
         )
         lines.append(f"- **group {index}** ({len(members)}): {', '.join(members)}{note}")
@@ -1935,12 +1982,15 @@ def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: 
         lines.append(
             f"- *no data*: {target} — `{error.split(':')[0]}` (excluded; not evidence of anything)"
         )
+    if summary["noise_floor_measured"]:
+        for target in summary["unmeasured"]:
+            lines.append(f"- *no noise floor*: {target} — its second rep failed; not weighed")
     lines.append("")
     verdict = summary["verdict"]
     if verdict == "split":
         lines.append(
-            f"**Verdict: split.** {len([g for g in summary['clusters'] if any(t not in summary['noisy'] for t in g)])} "
-            "distinguishable groups. Members of different groups are *not* serving the same "
+            f"**Verdict: split.** {summary['distinguishable_groups']} distinguishable groups. "
+            "Members of different groups are *not* serving the same "
             "artifact: expect different quantization, revision, or model. Confirm with a task "
             "eval before assuming the cheaper one is equivalent."
         )
@@ -1952,8 +2002,9 @@ def fingerprint_reports(prints: list[Fingerprint], targets: list[str], prompts: 
         )
     else:
         lines.append(
-            "**Verdict: inconclusive.** Fewer than two deterministic providers returned data, "
-            "so there is nothing to compare."
+            "**Verdict: inconclusive.** Fewer than two providers have a measured, "
+            "deterministic noise floor (two successful reps each, ≥98% self-agreement), so "
+            "differences between them can't be told apart from noise."
         )
     lines.append("")
     lines.append(
@@ -2010,7 +2061,7 @@ def run_fingerprint(
     prints: list[Fingerprint] = []
     total = len(prompt_names) * reps * len(cfg.targets)
 
-    async def go() -> None:
+    async def go(flush: Callable[[], None]) -> None:
         async with httpx.AsyncClient(
             http2=HTTP2,
             timeout=httpx.Timeout(cfg.timeout_s, connect=15.0),
@@ -2030,23 +2081,49 @@ def run_fingerprint(
                             )
                         if mock:
                             prints.append(mock_fingerprint(target, prompt_name, text, rep))
-                            continue
-                        prints.append(
-                            await fingerprint_once(
-                                client, target, text, prompt_name, max_tokens, cfg, rep
+                        else:
+                            prints.append(
+                                await fingerprint_once(
+                                    client, target, text, prompt_name, max_tokens, cfg, rep
+                                )
                             )
-                        )
-
-    asyncio.run(go())
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    with open(outdir / "fingerprints.jsonl", "w", encoding="utf-8") as handle:
-        for item in prints:
-            handle.write(json.dumps(item.__dict__) + "\n")
+                        flush()
 
     names = [t.name for t in cfg.targets]
-    report = fingerprint_reports(prints, names, prompt_names)
-    if mock:
-        report = "> **MOCK** — synthetic data for pipeline testing, not measurements.\n\n" + report
-    (outdir / "fingerprint.md").write_text(report, encoding="utf-8")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def render(partial: bool) -> str:
+        report = fingerprint_reports(prints, names, prompt_names)
+        if partial:
+            report = (
+                "> **PARTIAL** — interrupted; only the requests that finished are compared.\n\n"
+                + report
+            )
+        if mock:
+            report = (
+                "> **MOCK** — synthetic data for pipeline testing, not measurements.\n\n" + report
+            )
+        (outdir / "fingerprint.md").write_text(report, encoding="utf-8")
+        return report
+
+    with open(outdir / "fingerprints.jsonl", "w", encoding="utf-8") as handle:
+        written = 0
+
+        def flush() -> None:
+            nonlocal written
+            for item in prints[written:]:
+                handle.write(json.dumps(item.__dict__) + "\n")
+            written = len(prints)
+            handle.flush()
+
+        try:
+            asyncio.run(go(flush))
+        except KeyboardInterrupt:
+            flush()
+            if prints:
+                render(partial=True)
+            raise
+        flush()
+
+    report = render(partial=False)
     return report, prints, fingerprint_summary(prints, names, prompt_names)

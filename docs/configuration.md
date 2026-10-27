@@ -28,7 +28,7 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `api_key` | no* | literal key (avoid; use `api_key_env`) |
 | `headers` | no | extra request headers |
 | `extra_body` | no | merged into the JSON body — this is where pinning lives |
-| `price` | no | `{ in_per_1m, out_per_1m }` for cost columns |
+| `price` | no | `{ in_per_1m, out_per_1m }` in USD for cost columns; must be numbers |
 | `max_tokens_field` | no | per-target override |
 | `stream_options` | no | per-target override |
 | `mock` | no | synthetic profile, **only used with `--mock`** (see below) |

@@ -27,7 +27,8 @@ library API — drive it as a subprocess and parse `--json`.
    every mock output is flagged (`"mock": true`, `MOCK DATA`). README images come
    from `scripts/render_assets.py` with fictional providers only.
 8. **A failed request is not evidence.** Fingerprint targets with no data are
-   reported in `no_data`, never clustered as "different weights".
+   reported in `no_data`, never clustered as "different weights"; targets
+   without a measured, deterministic noise floor never decide the verdict.
 
 ## Commands
 
@@ -93,7 +94,8 @@ on **stdout** and exit non-zero.
 
 `discover` adds `model`, `endpoints[]`, `config`, `targets`.
 `fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
-`no_data{target: error}`, `noisy[]`, `noise_floor_measured`, `self_agreement{}`,
+`no_data{target: error}`, `noisy[]`, `unmeasured[]`, `distinguishable_groups`,
+`noise_floor_measured`, `self_agreement{}`,
 `pairs[]`, `prompt_tokens{}`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`.
 

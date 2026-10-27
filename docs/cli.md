@@ -12,7 +12,7 @@ Global flags may be given before or after the subcommand.
 | `--no-color` | disable ANSI colour (also honours `NO_COLOR`, `TERM=dumb`, non-TTY) |
 | `-q`, `--quiet` | suppress everything except errors (progress included) |
 | `-v`, `--verbose` | full traceback on unexpected errors |
-| `--version` | print version |
+| `--version` | print version (with `--json`: `{"version": "…"}`) |
 
 `FORCE_COLOR=1` forces colour when stdout is not a TTY (`NO_COLOR` still wins).
 Progress is drawn on stderr, only when stderr is a terminal.
@@ -128,8 +128,9 @@ tps fingerprint [-c FILE] [-o DIR] [--reps 2] [--prompt-count 2] [--max-tokens 1
 
 Sends the same prompt `--reps` times per target at temperature 0, non-streaming,
 with `logprobs`, and compares token sequences. Writes `fingerprints.jsonl` +
-`fingerprint.md`. Exits 4 if no request succeeded. See
-[fingerprinting](fingerprinting.md).
+`fingerprint.md`. Exits 4 if no request succeeded. `fingerprints.jsonl` is
+written as requests finish; Ctrl-C keeps them and writes a `PARTIAL` report.
+See [fingerprinting](fingerprinting.md).
 
 ---
 
@@ -150,6 +151,8 @@ mode:
 ```
 
 `schema_version` only changes on breaking changes; new keys may be added.
+`--help` and `--version` are wrapped too (`"help"` / `"version"` keys), and
+usage errors name the subcommand in `"command"`.
 
 ### `run`
 
@@ -205,6 +208,8 @@ Latency and rate fields describe the lowest concurrency (`concurrency`);
  "clusters":[["deepinfra","together"],["decart"]],
  "no_data":{"nebius":"http_401: ..."},
  "noisy":[],
+ "unmeasured":[],
+ "distinguishable_groups":2,
  "noise_floor_measured":true,
  "self_agreement":{"deepinfra":1.0,"together":0.99,"decart":1.0},
  "self_first_divergence":{"deepinfra":null,"together":142,"decart":null},
@@ -214,8 +219,10 @@ Latency and rate fields describe the lowest concurrency (`concurrency`);
 ```
 
 `verdict` is `split` (two or more distinguishable groups among deterministic
-targets), `consistent`, or `inconclusive` (fewer than two deterministic targets
-returned data). Targets that errored are in `no_data` and never in `clusters`.
+targets), `consistent`, or `inconclusive` (fewer than two targets with a
+measured, deterministic noise floor — always the case with `--reps 1`). Targets
+that errored are in `no_data` and never in `clusters`; `noisy` and `unmeasured`
+targets are clustered but never decide the verdict.
 
 ### `doctor`
 

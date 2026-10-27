@@ -55,6 +55,15 @@ def _detect_color(stream=None) -> bool:
     return (stream or sys.stdout).isatty()
 
 
+def _stream_width(stream, fallback: int) -> int:
+    if os.environ.get("COLUMNS", "").isdigit():
+        return int(os.environ["COLUMNS"])
+    try:
+        return os.get_terminal_size(stream.fileno()).columns
+    except (OSError, ValueError, AttributeError):
+        return fallback
+
+
 def bar(value: float | None, peak: float | None, width: int = 24) -> str:
     """Bar with 1/8-character resolution; empty for missing values."""
     if not value or not peak or value <= 0:
@@ -84,6 +93,7 @@ class Col:
     header: str
     align: str = "r"  # "l" | "r"
     flex: bool = False  # may shrink to fit the terminal (bars)
+    drop: int = 0  # >0: may be hidden on narrow terminals, highest first
 
 
 @dataclass
@@ -242,6 +252,17 @@ class UI:
                 widths[i] -= shrink
                 overflow -= shrink
         inner = sum(widths) + gap * (len(cols) - 1)
+        # still too wide: hide optional columns, least important first
+        keep = list(range(len(cols)))
+        for i in sorted((i for i, c in enumerate(cols) if c.drop), key=lambda i: -cols[i].drop):
+            if inner + 4 <= self.width:
+                break
+            keep.remove(i)
+            inner -= widths[i] + gap
+        if len(keep) < len(cols):
+            cols = [cols[i] for i in keep]
+            widths = [widths[i] for i in keep]
+            rows = [[row[i] if i < len(row) else "" for i in keep] for row in rows]
         inner = max(inner, len(title) + 3, min(len(footer), self.width - 4))
 
         def fit(text: str, width: int) -> str:
@@ -365,16 +386,22 @@ class Progress:
                 done, label = self.done, self.label
             elapsed = time.monotonic() - self.started
             eta = elapsed / done * (self.total - done) if done else None
-            width = max(10, min(32, self.ui.width - 70))
+            # sized to stderr (the stream it draws on) and never wider than the
+            # terminal: a wrapped line can't be cleared with \r and piles up
+            cols = _stream_width(sys.stderr, self.ui.width)
+            count = f"{done:>4}/{self.total:<4}"
+            timing = clock(elapsed) + (f" · eta {clock(eta)}" if eta is not None else "")
+            width = max(10, min(32, cols - 60))
+            room = cols - 1 - (width + len(count) + len(timing) + 7)
+            if room < 0:
+                width = max(4, width + room)
+                room = 0
+            if width + len(count) + len(timing) + 7 > cols - 1:
+                timing = ""
             filled = round(width * done / self.total)
             track = self._paint(CYAN, "━" * filled) + self._paint(GREY, "━" * (width - filled))
             spin = self._paint(CYAN, SPINNER[frame % len(SPINNER)])
-            timing = clock(elapsed) + (f" · eta {clock(eta)}" if eta is not None else "")
-            room = max(0, self.ui.width - width - len(timing) - 24)
-            line = (
-                f"  {spin} {track} {done:>4}/{self.total:<4} "
-                f"{label[:room]:<{room}} {self._paint(GREY, timing)}"
-            )
+            line = f"  {spin} {track} {count} {label[:room]:<{room}} {self._paint(GREY, timing)}"
             sys.stderr.write("\r\033[2K" + line)
             sys.stderr.flush()
             frame += 1

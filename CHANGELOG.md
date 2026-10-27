@@ -34,5 +34,11 @@ First public release.
 - Bad flags exited 2 ("missing credentials"); they exit 1 with a JSON error.
 - Input cost was dropped when a provider omitted `usage`.
 - Duplicate target names silently pooled their samples.
+- The fingerprint verdict counted targets with no measured noise floor
+  (`--reps 1`, or a failed second rep) as deterministic, so it could say
+  `split` without evidence.
+- API keys could survive in stored errors when sent via custom headers or cut
+  mid-key by truncation; both are now redacted.
+- A quoted price crashed the run after every request had been sent.
 
 [0.1.0]: https://github.com/teal-sea/tpsbench

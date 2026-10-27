@@ -41,12 +41,18 @@ their noise floors (`max(0.98, min_floor − 0.01)`). The **verdict** reads them
 |---|---|
 | `split` | two or more distinguishable groups among deterministic targets |
 | `consistent` | one group — indistinguishable at this resolution |
-| `inconclusive` | fewer than two deterministic targets returned data |
+| `inconclusive` | fewer than two targets with a measured, deterministic noise floor |
 
-Two things never move the verdict: a target whose request **failed** (listed
-under *no data* — absence of evidence, not different weights), and a target that
-is **non-deterministic** at temperature 0 (its placement can't be interpreted).
-With `--reps 1` there is no noise floor, and the report says so.
+Only a target whose noise floor was **measured** (two successful reps) and is
+high (≥ 98% self-agreement) can move the verdict. Three kinds never do:
+
+- a target whose request **failed** — listed under *no data*: absence of
+  evidence, not different weights;
+- a target that is **non-deterministic** at temperature 0 — `noisy`: its
+  placement can't be interpreted;
+- a target with **no measured floor** — `unmeasured`: its second rep failed, or
+  the run used `--reps 1`. With `--reps 1` nobody has a floor, so the verdict is
+  always `inconclusive`.
 
 ![tps fingerprint output — demo data](assets/screenshot-fingerprint.svg)
 
