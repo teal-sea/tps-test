@@ -11,7 +11,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,19 @@ class ProviderError(TpsError):
 
 # identify benchmark traffic honestly to the providers being measured
 USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
+
+ANTHROPIC_VERSION = "2023-06-01"
+APIS = ("openai", "anthropic")
+# Claude API stop reasons in OpenAI's vocabulary, so one report covers both
+ANTHROPIC_STOP = {
+    "max_tokens": "length",
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+}
+# request fields tps sets itself; overriding them in extra_body would silently
+# change what is measured (and what --dry-run budgets for)
+RESERVED_BODY = ("model", "messages", "stream", "max_tokens", "max_completion_tokens")
 
 
 SECRET_HEADER_HINTS = ("key", "token", "auth", "secret", "password")
@@ -194,12 +207,24 @@ class Target:
     max_tokens_field: str | None = None
     send_stream_options: bool = True
     mock: dict[str, Any] | None = None
+    # "openai" = /chat/completions; "anthropic" = the native Claude Messages
+    # API, the only one that accepts Claude subscription (OAuth) tokens
+    api: str = "openai"
 
     def url(self) -> str:
         base = self.base_url.rstrip("/")
-        if base.endswith("/chat/completions"):
-            return base
-        return base + "/chat/completions"
+        path = "/messages" if self.api == "anthropic" else "/chat/completions"
+        return base if base.endswith(path) else base + path
+
+    def auth_headers(self) -> dict[str, str]:
+        key = self.key()
+        if self.api == "anthropic":
+            # API keys go in x-api-key; OAuth / session tokens are bearer tokens
+            auth = {"x-api-key": key} if key.startswith("sk-ant-api") else {}
+            if key and not auth:
+                auth = {"Authorization": f"Bearer {key}"}
+            return {"anthropic-version": ANTHROPIC_VERSION, **auth}
+        return {"Authorization": f"Bearer {key}"} if key else {}
 
     def key(self) -> str:
         if self.api_key:
@@ -240,7 +265,9 @@ class RunConfig:
     concurrency: list[int] = field(default_factory=lambda: [1])
     warmup: int = 2
     timeout_s: float = 180.0
-    temperature: float = 0.0
+    # None = each API's default (0 for OpenAI-compatible, omitted for the Claude
+    # API, which rejects it); "omit" = never send it; a number = always send it
+    temperature: float | str | None = None
     max_tokens_field: str = "max_tokens"
     stream_options: bool = True
     baseline: str | None = None
@@ -260,8 +287,7 @@ def validate(cfg: RunConfig, where: str = "config") -> None:
         raise UsageError(f"{where}: warmup cannot be negative")
     if cfg.timeout_s <= 0:
         raise UsageError(f"{where}: timeout_s must be positive")
-    if cfg.temperature < 0:
-        raise UsageError(f"{where}: temperature cannot be negative")
+    cfg.temperature = parse_temperature(cfg.temperature, where)
     if not cfg.prompts:
         raise UsageError(f"{where}: no prompts selected")
     for name, spec in cfg.prompts.items():
@@ -276,6 +302,33 @@ def validate(cfg: RunConfig, where: str = "config") -> None:
         raise UsageError(
             f"{where}: baseline {cfg.baseline!r} is not a target name; have {', '.join(names)}"
         )
+
+
+def parse_temperature(value: Any, where: str) -> float | str | None:
+    if value is None or value == "omit":
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("omit", "none"):
+        return "omit"
+    try:
+        number = float(value) if not isinstance(value, bool) else -1.0
+    except (TypeError, ValueError):
+        number = -1.0
+    if number < 0:
+        raise UsageError(f'{where}: temperature must be a number ≥ 0, or "omit" (got {value!r})')
+    return number
+
+
+def request_temperature(cfg: RunConfig, target: Target) -> float | None:
+    """The temperature to send this target, or None to leave the field out.
+
+    Claude 4.7+ rejects any sampling parameter, so the Claude API default is
+    to omit it; OpenAI-compatible targets default to 0 for comparability.
+    """
+    if cfg.temperature == "omit":
+        return None
+    if cfg.temperature is None:
+        return None if target.api == "anthropic" else 0.0
+    return float(cfg.temperature)
 
 
 def _table(entry: dict[str, Any], key: str, label: str, path: Path) -> dict[str, Any]:
@@ -325,6 +378,21 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
             if not entry.get(key):
                 raise UsageError(f"{path}: {label} is missing `{key}`")
         price = _table(entry, "price", label, path)
+        api = str(entry.get("api", "openai"))
+        if api not in APIS:
+            raise UsageError(f"{path}: {label}: `api` must be one of {', '.join(APIS)}")
+        extra_body = _table(entry, "extra_body", label, path)
+        reserved = sorted(
+            k
+            for k in extra_body
+            if k in RESERVED_BODY or k == (entry.get("max_tokens_field") or "max_tokens")
+        )
+        if reserved:
+            raise UsageError(
+                f"{path}: {label}: extra_body can't set {', '.join(reserved)} — tps sends "
+                "those itself (token caps: a prompt's max_tokens, --max-tokens, or "
+                "max_tokens_field for the field name)"
+            )
         targets.append(
             Target(
                 name=str(entry.get("name") or entry["model"]),
@@ -333,12 +401,13 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
                 api_key_env=entry.get("api_key_env"),
                 api_key=entry.get("api_key"),
                 headers=_table(entry, "headers", label, path),
-                extra_body=_table(entry, "extra_body", label, path),
+                extra_body=extra_body,
                 price_in=_price(price.get("in_per_1m"), "price.in_per_1m", label, path),
                 price_out=_price(price.get("out_per_1m"), "price.out_per_1m", label, path),
                 max_tokens_field=entry.get("max_tokens_field"),
                 send_stream_options=bool(entry.get("stream_options", True)),
                 mock=_table(entry, "mock", label, path) if "mock" in entry else None,
+                api=api,
             )
         )
 
@@ -380,7 +449,7 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
             concurrency=[int(c) for c in conc],
             warmup=int(run.get("warmup", 2)),
             timeout_s=float(run.get("timeout_s", 180)),
-            temperature=float(run.get("temperature", 0.0)),
+            temperature=parse_temperature(run.get("temperature"), str(path)),
             max_tokens_field=run.get("max_tokens_field", "max_tokens"),
             stream_options=bool(run.get("stream_options", True)),
             baseline=run.get("baseline"),
@@ -422,7 +491,8 @@ class Sample:
     wall_clock: str = ""
     phase: str = "measure"  # "warmup" rows are discarded by every statistic
     finish_reason: str | None = None  # "length" = stopped by max_tokens
-    reasoning_tokens: int | None = None  # from usage.completion_tokens_details
+    reasoning_tokens: int | None = None  # from usage: OpenAI or Claude token details
+    hidden_reasoning_tokens: int = 0  # billed and generated, but never streamed
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -470,23 +540,11 @@ async def stream_once(
     batch: int,
     send_stream_options: bool,
 ) -> Sample:
-    body: dict[str, Any] = {
-        "model": target.model,
-        "messages": [{"role": "user", "content": prompt_text}],
-        "temperature": cfg.temperature,
-        "stream": True,
-    }
-    field_name = target.max_tokens_field or cfg.max_tokens_field
-    body[field_name] = max_tokens
-    if send_stream_options:
+    body = request_body(target, cfg, prompt_text, max_tokens, stream=True)
+    if send_stream_options and target.api == "openai":
         body["stream_options"] = {"include_usage": True}
-    # extra_body last: it is how provider pinning / vendor flags get applied
-    body.update(target.extra_body)
-
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-    key = target.key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    headers.update(target.auth_headers())
     headers.update(target.headers)
 
     sample = Sample(
@@ -502,8 +560,9 @@ async def stream_once(
     first = last = None
     gaps: list[float] = []
     chars = 0  # content + reasoning: the chars/4 fallback and first-chunk share
+    reasoning_chars = 0
     first_chars = 0
-    usage: dict[str, Any] | None = None
+    usage: dict[str, Any] = {}
     served: str | None = None
     stream_error: str | None = None
 
@@ -561,20 +620,13 @@ async def stream_once(
                     message = err.get("message") if isinstance(err, dict) else err
                     stream_error = redact(f"stream_error: {message}", target.secrets())[:300]
                     break
-                if isinstance(obj.get("usage"), dict):
-                    usage = obj["usage"]
-                if obj.get("provider") and not served:
-                    served = str(obj["provider"])
-                choices = obj.get("choices") or []
-                if not choices or not isinstance(choices[0], dict):
-                    continue
-                if choices[0].get("finish_reason"):
-                    sample.finish_reason = str(choices[0]["finish_reason"])
-                delta = choices[0].get("delta") or {}
-                piece = delta.get("content") or ""
-                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                piece = piece if isinstance(piece, str) else ""
-                reasoning = reasoning if isinstance(reasoning, str) else ""
+                event = parse_event(obj, target.api)
+                usage.update(event["usage"])
+                if event["provider"] and not served:
+                    served = event["provider"]
+                if event["finish"]:
+                    sample.finish_reason = event["finish"]
+                piece, reasoning = event["piece"], event["reasoning"]
                 if not piece and not reasoning:
                     continue
                 now = time.perf_counter()
@@ -590,6 +642,7 @@ async def stream_once(
                 last = now
                 sample.chunks += 1
                 chars += size
+                reasoning_chars += len(reasoning)
 
     except httpx.TimeoutException:
         sample.error = "timeout"
@@ -612,9 +665,14 @@ async def stream_once(
             usage.get("completion_tokens"), usage.get("output_tokens")
         )
         sample.in_tokens = _first_present(usage.get("prompt_tokens"), usage.get("input_tokens"))
-        details = usage.get("completion_tokens_details")
-        if isinstance(details, dict):
-            sample.reasoning_tokens = details.get("reasoning_tokens")
+        for key, name in (
+            ("completion_tokens_details", "reasoning_tokens"),  # OpenAI-compatible
+            ("output_tokens_details", "thinking_tokens"),  # Claude API
+        ):
+            details = usage.get(key)
+            if isinstance(details, dict) and details.get(name) is not None:
+                sample.reasoning_tokens = details[name]
+    out_from_usage = sample.out_tokens is not None
     if sample.out_tokens is None and chars:
         sample.out_tokens = max(1, round(chars / 4))
         estimated = True
@@ -624,23 +682,92 @@ async def stream_once(
         estimated = True
     sample.count_source = "chars/4" if estimated else "usage"
 
-    if first is not None and last is not None and last > first and sample.out_tokens:
+    # Reasoning that was counted in usage but never streamed (Claude's omitted
+    # thinking, o-series reasoning) happened before the window opened: crediting
+    # it to the window would inflate tok/s by the thinking share.
+    hidden = (sample.reasoning_tokens or 0) if out_from_usage and not reasoning_chars else 0
+    sample.hidden_reasoning_tokens = hidden
+    streamed = (sample.out_tokens or 0) - hidden
+    if first is not None and last is not None and last > first and streamed > 0:
         sample.decode_s = last - first
         # Tokens in the first chunk were generated before the window opened.
         # Estimate them by that chunk's share of the text, so providers that
         # send big chunks aren't credited with tokens they made "for free".
-        first_tokens = max(1.0, sample.out_tokens * first_chars / chars) if chars else 1.0
-        if sample.out_tokens > first_tokens:
-            sample.out_tps = (sample.out_tokens - first_tokens) / sample.decode_s
+        first_tokens = max(1.0, streamed * first_chars / chars) if chars else 1.0
+        if streamed > first_tokens:
+            sample.out_tps = (streamed - first_tokens) / sample.decode_s
         if gaps:
             sample.itl_p50_ms = percentile(gaps, 0.5) * 1000
             sample.itl_p90_ms = percentile(gaps, 0.9) * 1000
     # A single chunk has no decode window: the rate is unknown, not infinite.
 
-    sample.ok = bool(sample.chunks and sample.out_tokens)
+    # Billed tokens and a finish_reason but nothing streamed is a model that
+    # only thought (hidden reasoning hit the cap) — a result, not an empty stream.
+    sample.ok = bool(sample.out_tokens and (sample.chunks or sample.finish_reason))
     if not sample.ok and not sample.error:
         sample.error = "empty_stream"
     return sample
+
+
+def request_body(
+    target: Target, cfg: RunConfig, prompt_text: str, max_tokens: int, stream: bool
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": target.model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "stream": stream,
+    }
+    temperature = request_temperature(cfg, target)
+    if temperature is not None:
+        body["temperature"] = temperature
+    if target.api == "anthropic":
+        body["max_tokens"] = max_tokens
+    else:
+        body[target.max_tokens_field or cfg.max_tokens_field] = max_tokens
+    # extra_body last: it is how provider pinning / vendor flags get applied
+    body.update(target.extra_body)
+    return body
+
+
+def parse_event(obj: dict[str, Any], api: str) -> dict[str, Any]:
+    """One streamed JSON event, reduced to what the timing loop needs."""
+    event: dict[str, Any] = {
+        "usage": {},
+        "provider": None,
+        "finish": None,
+        "piece": "",
+        "reasoning": "",
+    }
+    if api == "anthropic":
+        kind = obj.get("type")
+        if kind == "message_start":
+            event["usage"] = (obj.get("message") or {}).get("usage") or {}
+        elif kind == "message_delta":
+            event["usage"] = obj.get("usage") or {}
+            stop = (obj.get("delta") or {}).get("stop_reason")
+            event["finish"] = ANTHROPIC_STOP.get(stop, stop)
+        elif kind == "content_block_delta":
+            delta = obj.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                event["piece"] = delta.get("text") or ""
+            elif delta.get("type") == "thinking_delta":
+                event["reasoning"] = delta.get("thinking") or ""  # "" when omitted
+    else:
+        if isinstance(obj.get("usage"), dict):
+            event["usage"] = obj["usage"]
+        if obj.get("provider"):
+            event["provider"] = str(obj["provider"])
+        choices = obj.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            if choices[0].get("finish_reason"):
+                event["finish"] = str(choices[0]["finish_reason"])
+            delta = choices[0].get("delta") or {}
+            event["piece"] = delta.get("content") or ""
+            event["reasoning"] = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    for key in ("piece", "reasoning"):
+        if not isinstance(event[key], str):
+            event[key] = ""
+    return event
 
 
 async def run_target_batch(
@@ -833,6 +960,8 @@ def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
                 "pin": t.extra_body.get("provider"),
                 "price_in": t.price_in,
                 "price_out": t.price_out,
+                "api": t.api,
+                "temperature": request_temperature(cfg, t),  # null = not sent
             }
             for t in cfg.targets
         ],
@@ -997,6 +1126,7 @@ def _bucket() -> dict[str, Any]:
         "n": 0,
         "truncated": 0,
         "reasoning_only": 0,
+        "hidden": [],
         "errors": {},
         "served": set(),
         "count_source": set(),
@@ -1046,6 +1176,7 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
             bucket["truncated"] += s.get("finish_reason") == "length"
             # every chunk was reasoning: there is no answer to time
             bucket["reasoning_only"] += s.get("first_content_s") is None
+            bucket["hidden"].append(s.get("hidden_reasoning_tokens") or 0)
             for name, source in _FIELDS:
                 bucket[name].append(s.get(source))
             batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s.get("out_tokens") or 0)
@@ -1084,6 +1215,7 @@ def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         "n": bucket["n"],
         "truncated": bucket["truncated"],
         "reasoning_only": bucket["reasoning_only"],
+        "hidden_reasoning_tokens_median": median(bucket["hidden"]) or None,
         "errors": dict(bucket["errors"]),
         "count_source": sorted(x for x in bucket["count_source"] if x),
         "served_by": sorted(x for x in bucket["served"] if x),
@@ -1107,12 +1239,25 @@ def reasoning_note(st: dict[str, Any]) -> str | None:
     if st["truncated"] == ok:
         return (
             f"hit the token cap while reasoning ({ok}/{ok} finish_reason=length, no answer "
-            "text) — TTFT and tok/s measured thinking, not answering; raise --max-tokens"
+            "text) — any TTFT or tok/s here measured thinking, not answering; "
+            "raise --max-tokens"
         )
     return (
-        f"no answer text in {ok}/{ok} responses (reasoning only) — TTFT and tok/s "
-        "measured thinking, not answering"
+        f"no answer text in {ok}/{ok} responses (reasoning only) — any TTFT or tok/s "
+        "here measured thinking, not answering"
     )
+
+
+def row_notes(st: dict[str, Any]) -> list[str]:
+    """Everything a reader needs to interpret a row's numbers correctly."""
+    notes = [note] if (note := reasoning_note(st)) else []
+    hidden = st["hidden_reasoning_tokens_median"]
+    if hidden and st["reasoning_only"] < st["ok"]:
+        notes.append(
+            f"TTFT includes ~{hidden:.0f} thinking tokens (median) that the API doesn't "
+            "stream; tok/s counts only the streamed answer"
+        )
+    return notes
 
 
 def request_cost(
@@ -1184,9 +1329,15 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
     model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
     caps = sorted(set((meta.get("max_tokens") or {}).values()))
     cap = f" · max_tokens {'/'.join(map(str, caps))}" if caps else ""
+    targets_meta = meta.get("targets", [])
+    if targets_meta and all("temperature" in t for t in targets_meta):
+        temps = {t["temperature"] for t in targets_meta}
+        temp = "/".join(sorted("not sent" if v is None else f"{v:g}" for v in temps))
+    else:  # runs recorded before per-target temperatures
+        temp = str(meta.get("temperature"))
     lines.append(
         f"- model: `{model}` · reps {meta.get('reps')} · "
-        f"concurrency {meta.get('concurrency')} · temp {meta.get('temperature')}{cap} · "
+        f"concurrency {meta.get('concurrency')} · temp {temp}{cap} · "
         f"http2 {meta.get('http2')}"
     )
     version = f" · tps {meta['tps_version']}" if meta.get("tps_version") else ""
@@ -1270,11 +1421,10 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                     ]
             lines.append("| " + " | ".join(str(c) for c in cells) + " |")
         lines.append("")
-        notes = [(t, reasoning_note(bucket_stats(b))) for t, b in rows]
+        notes = [(t, note) for t, b in rows for note in row_notes(bucket_stats(b))]
         for target, note in notes:
-            if note:
-                lines.append(f"> ⚠ **{target}**: {note}.")
-        if any(note for _t, note in notes):
+            lines.append(f"> ⚠ **{target}**: {note}.")
+        if notes:
             lines.append("")
 
         peak = max((p50(b["tps"]) or 0 for _t, b in rows), default=0.0)
@@ -1631,6 +1781,7 @@ def endpoint_toml(
     api_key_env: str | None = None,
     price: tuple[float, float] | None = None,
     source: str = "tps init --endpoint",
+    api: str = "openai",
 ) -> str:
     """A one-target config for any OpenAI-compatible endpoint, no gateway needed.
 
@@ -1654,6 +1805,8 @@ def endpoint_toml(
         f"base_url = {_toml_inline(base_url)}",
         f"model = {_toml_inline(model)}",
     ]
+    if api != "openai":
+        lines.append(f"api = {_toml_inline(api)}")
     if api_key_env:
         lines.append(f"api_key_env = {_toml_inline(api_key_env)}")
     if price:
@@ -1787,23 +1940,19 @@ async def fingerprint_once(
     rep: int,
     use_logprobs: bool = True,
 ) -> Fingerprint:
-    field_name = target.max_tokens_field or cfg.max_tokens_field
-    body: dict[str, Any] = {
-        "model": target.model,
-        "messages": [{"role": "user", "content": prompt_text}],
-        "temperature": 0.0,
-        "stream": False,
-        field_name: max_tokens,
-    }
+    # Greedy where the API allows it. The Claude API rejects sampling settings
+    # and has no logprobs, so Claude is compared on text and its self-agreement
+    # decides whether it can be placed at all.
+    body = request_body(target, replace(cfg, temperature=0.0), prompt_text, max_tokens, False)
+    use_logprobs = use_logprobs and target.api == "openai"
     if use_logprobs:
         body["logprobs"] = True
         body["top_logprobs"] = 5
-    body.update(target.extra_body)
+    if target.api == "anthropic":
+        body.pop("temperature", None)
 
     headers = {"Content-Type": "application/json"}
-    key = target.key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    headers.update(target.auth_headers())
     headers.update(target.headers)
 
     result = Fingerprint(target=target.name, prompt=prompt_name, rep=rep, ok=False)
@@ -1834,8 +1983,26 @@ async def fingerprint_once(
         result.error = "non_json_response"
         return result
     usage = payload.get("usage") or {}
-    result.prompt_tokens = usage.get("prompt_tokens")
-    result.completion_tokens = usage.get("completion_tokens")
+    result.prompt_tokens = _first_present(usage.get("prompt_tokens"), usage.get("input_tokens"))
+    result.completion_tokens = _first_present(
+        usage.get("completion_tokens"), usage.get("output_tokens")
+    )
+
+    if target.api == "anthropic":
+        blocks = payload.get("content") or []
+        result.text = "".join(
+            b.get("text") or "" for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+        )
+        result.mode = "text"
+        result.ok = bool(result.text)
+        if not result.ok:
+            capped = payload.get("stop_reason") == "max_tokens"
+            result.error = (
+                "no_answer: hit max_tokens while thinking — raise --max-tokens"
+                if capped
+                else "empty_response"
+            )
+        return result
 
     choices = payload.get("choices") or []
     if not choices:

@@ -51,6 +51,17 @@ optional and only fills the cost columns. The run saves the generated config as
 `runs/<timestamp>/targets.toml`; `tps init --endpoint … --model …` writes the same
 file up front, ready for more `[[targets]]` blocks.
 
+**Claude**, on an API key or a Claude subscription token — the native API, so
+no `temperature` is sent and hidden thinking stays out of tok/s:
+
+```bash
+tps run --api anthropic --model claude-opus-5-5 --api-key-env ANTHROPIC_API_KEY \
+        --price 4,20 --max-tokens 2048
+```
+
+`--max-tokens 2048` matters: at the built-in prompts' 256-token cap Claude
+usually spends the whole budget thinking and never answers (the row says so).
+
 **Every provider of a model, via OpenRouter:**
 
 ```bash

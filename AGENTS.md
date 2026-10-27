@@ -46,7 +46,11 @@ tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--time
 
 `--base-url` measures one OpenAI-compatible endpoint with no config file (not
 with `-c`); the generated config is saved as `<run_dir>/targets.toml`.
-`discover` and `init --model` are OpenRouter-only; everything else is not.
+`--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
+Messages API — the only Anthropic endpoint that accepts subscription/OAuth
+tokens; it sends no `temperature` (Claude 4.7+ 400s on it) and keeps hidden
+thinking out of tok/s. `discover` and `init --model` are OpenRouter-only;
+everything else is not.
 
 Global: `--json`, `--no-color`, `-q`, `-v`, `--version`. May appear before or
 after the subcommand. Config defaults to `targets.toml`, then
@@ -88,7 +92,7 @@ on **stdout** and exit non-zero.
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
     "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
-    "truncated": 7, "reasoning_only": 0, "notes": [],
+    "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 35, "n": 35, "errors": {},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {"1": {"ok": 7, "n": 7, "...": "..."}, "4": {"ok": 28, "n": 28, "...": "..."}},
@@ -162,7 +166,11 @@ requests ≈ 1 min. Always dry-run a 41-target config first.
 
 - `missing credentials` (2) — the env var in `api_key_env` (`--api-key-env`) isn't set.
 - A row with `reasoning_only == ok` — the model never answered inside
-  `max_tokens`; see above.
+  `max_tokens`; see above. Claude Opus 5.5 does this at the built-in 256-token
+  cap: use `--max-tokens 2048`.
+- `http_400 … temperature` on Claude — the target is on the OpenAI-compatible
+  layer; use `--api anthropic`, or `--temperature omit`.
+- `extra_body can't set …` (1) — token caps come from prompts / `--max-tokens`.
 - `HTTP 404` on a pin — the provider slug is wrong or the model moved; re-run `discover`.
 - Everything timing out — check egress/proxy; `tps doctor --network`.
 - Mock data — `"mock": true` in `meta.json`; never report it as a measurement.

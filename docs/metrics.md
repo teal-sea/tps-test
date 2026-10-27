@@ -20,8 +20,10 @@ For reasoning models the report adds a **first answer** column: time to the firs
 when it differs from TTFT.
 
 A reasoning model can spend its entire `max_tokens` thinking and never answer
-(`finish_reason: "length"`, no content chunks). Its TTFT and tok/s are then real
-measurements *of the thinking*, and first answer and ITL have nothing to time.
+(`finish_reason: "length"`, no content chunks). If the thinking streamed, its
+TTFT and tok/s are real measurements *of the thinking*; if it was hidden (Claude),
+nothing streamed at all. Either way first answer and ITL have nothing to time,
+and the request still counts as `ok` — it is a result, not an empty stream.
 `tps` counts these responses (`reasoning_only`, next to `truncated` for any
 response stopped by the cap) and says so under the table — *measured thinking,
 not answering* — instead of leaving a bare `—`. Raise `--max-tokens`.
@@ -136,7 +138,10 @@ per-request column.
 - **Prompt-cache effects** — each request uses the same prompt, so cache hits are
   included if the provider does them. That is realistic for repeated workloads but
   flattering for first-call latency.
-- **Hidden reasoning** — if a provider counts reasoning tokens in `usage` without
-  streaming them, tok/s is inflated for that row. Compare reasoning models with
-  care.
+- **Hidden reasoning** — when a provider bills reasoning it doesn't stream and
+  reports how much (`completion_tokens_details.reasoning_tokens`, or the Claude
+  API's `output_tokens_details.thinking_tokens`), those tokens are kept out of
+  tok/s and recorded as `hidden_reasoning_tokens`; the row notes that TTFT
+  includes them. A provider that hides reasoning *without* reporting it still
+  inflates tok/s, and nothing in the stream can reveal it.
 - **Tool calling, JSON mode, vision** — chat text only.

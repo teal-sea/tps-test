@@ -45,10 +45,12 @@ TOKEN_DELAY = 0.01
 BIG_CHUNK = 32  # tokens per chunk for the "big-chunks" model
 BIG_DELAY = 0.02
 THINK = 300  # the "thinker" model reasons this long before it answers
+HIDDEN = 40  # thinking tokens the Claude-like models bill but never stream
 
 INFLIGHT = {"n": 0}
 INFLIGHT_LOCK = threading.Lock()
-SEEN: list[tuple[str, int | None]] = []  # (model, max_tokens) of every request
+SEEN: list[tuple[str, int | None, bool]] = []  # (model, max_tokens, sent temperature?)
+AUTH: list[str] = []  # how each Claude API request authenticated
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -79,7 +81,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         model = body.get("model", "")
-        SEEN.append((model, body.get("max_tokens")))
+        SEEN.append((model, body.get("max_tokens"), "temperature" in body))
+        if self.path.rstrip("/").endswith("/messages"):
+            self._claude(body)
+            return
 
         if model == "echo-key":  # some providers echo the submitted key in errors
             # header key near the start; the bearer key straddles the 600-char cut
@@ -182,17 +187,65 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
         if want_usage:
-            self._emit(
-                {
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 11,
-                        "completion_tokens": TOKENS,
-                        "total_tokens": 11 + TOKENS,
-                    },
-                }
-            )
+            usage = {
+                "prompt_tokens": 11,
+                "completion_tokens": TOKENS,
+                "total_tokens": 11 + TOKENS,
+            }
+            if model == "hidden-reasoner":  # o-series style: billed, never streamed
+                usage["completion_tokens"] += HIDDEN
+                usage["completion_tokens_details"] = {"reasoning_tokens": HIDDEN}
+            self._emit({"choices": [], "usage": usage})
         self._done()
+
+    def _claude(self, body: dict) -> None:
+        """The native Claude Messages API, as Claude Opus 5.5 behaves on it:
+        thinking is billed in output_tokens_details but streams as empty
+        deltas, and any sampling parameter is a 400."""
+        AUTH.append("x-api-key" if self.headers.get("x-api-key") else "bearer")
+        if "temperature" in body:
+            self._json(
+                400,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "temperature is deprecated",
+                    },
+                },
+            )
+            return
+        model, cap = body.get("model", ""), int(body.get("max_tokens") or 0)
+        answers = model != "claude-capped"
+        out = HIDDEN + TOKENS if answers else cap
+        usage = {
+            "input_tokens": 11,
+            "output_tokens": out,
+            "output_tokens_details": {"thinking_tokens": HIDDEN if answers else cap},
+        }
+        stop = "end_turn" if answers else "max_tokens"
+        text = " ".join(f"tok{i}" for i in range(TOKENS))
+        if not body.get("stream"):
+            content = [{"type": "thinking", "thinking": ""}]
+            content += [{"type": "text", "text": text}] if answers else []
+            self._json(200, {"content": content, "stop_reason": stop, "usage": usage})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        start = {"usage": {"input_tokens": 11, "output_tokens": 1}}
+        self._emit({"type": "message_start", "message": start})
+        thinking = {"type": "thinking", "thinking": ""}
+        self._emit({"type": "content_block_start", "index": 0, "content_block": thinking})
+        time.sleep(FIRST_DELAY)  # the hidden thinking
+        delta = {"type": "thinking_delta", "thinking": ""}
+        self._emit({"type": "content_block_delta", "index": 0, "delta": delta})
+        for i in range(TOKENS if answers else 0):
+            time.sleep(TOKEN_DELAY)
+            delta = {"type": "text_delta", "text": f"tok{i} "}
+            self._emit({"type": "content_block_delta", "index": 1, "delta": delta})
+        self._emit({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": usage})
+        self._emit({"type": "message_stop"})
 
     def _emit(self, obj: dict) -> None:
         try:
@@ -463,6 +516,83 @@ async def main() -> int:
                 note_for(capped, reasoning),
             )
             check("answered row has no note", note_for(reasoning) == "", note_for(reasoning))
+
+            print("native Claude API (hidden thinking, no sampling params):")
+            claude_key = "sk-ant-api03-selftest-0123456789"
+            claude = await once(tgt("claude-sim", api="anthropic", api_key=claude_key))
+            check("claude: ok, answer streamed", claude.ok and claude.first_content_s is not None)
+            check(
+                "claude: no temperature sent by default (it's a 400 there)",
+                SEEN[-1] == ("claude-sim", 64, False),
+                str(SEEN[-1]),
+            )
+            check(
+                "claude: API key goes in x-api-key, stop_reason mapped",
+                AUTH[-1] == "x-api-key" and claude.finish_reason == "stop",
+                f"{AUTH[-1]} {claude.finish_reason}",
+            )
+            check(
+                "claude: billed thinking tokens recorded as hidden",
+                claude.out_tokens == HIDDEN + TOKENS
+                and claude.reasoning_tokens == HIDDEN
+                and claude.hidden_reasoning_tokens == HIDDEN,
+                f"{claude.out_tokens} {claude.reasoning_tokens} {claude.hidden_reasoning_tokens}",
+            )
+            check(
+                "claude: tok/s counts only streamed tokens (hidden thinking not credited)",
+                claude.out_tps is not None
+                and abs(claude.out_tps - expected_tps) / expected_tps < 0.2,
+                f"{claude.out_tps} vs {expected_tps:.1f}",
+            )
+            await once(tgt("claude-sim", api="anthropic", api_key="sk-ant-oat01-subscription"))
+            check("claude: an OAuth/subscription token is sent as a bearer", AUTH[-1] == "bearer")
+            silent = await once(tgt("claude-capped", api="anthropic", api_key=claude_key))
+            check(
+                "claude: thinking that ate the whole cap is a result, not an empty stream",
+                silent.ok
+                and silent.error is None
+                and silent.finish_reason == "length"
+                and silent.ttft_s is None
+                and silent.out_tps is None,
+                f"{silent.ok} {silent.error} {silent.finish_reason}",
+            )
+            check(
+                "claude: and its note says the model never answered",
+                "hit the token cap while reasoning" in note_for(silent),
+                note_for(silent),
+            )
+            hot = core.RunConfig(targets=[], prompts={}, reps=1, concurrency=[1], temperature=0.5)
+            sent = await core.stream_once(
+                client,
+                tgt("claude-sim", api="anthropic", api_key=claude_key),
+                "hello",
+                "prose-256",
+                64,
+                hot,
+                1,
+                0,
+                True,
+            )
+            check(
+                "claude: an explicit temperature is still sent (and its 400 reported)",
+                not sent.ok and (sent.error or "").startswith("http_400"),
+                str(sent.error),
+            )
+            o_series = await once(tgt("hidden-reasoner"))
+            check(
+                "OpenAI-format hidden reasoning: not credited to tok/s either",
+                o_series.hidden_reasoning_tokens == HIDDEN
+                and o_series.out_tps is not None
+                and abs(o_series.out_tps - expected_tps) / expected_tps < 0.2,
+                f"{o_series.hidden_reasoning_tokens} {o_series.out_tps}",
+            )
+            stats = core.summarize([claude.as_dict(), claude.as_dict()])
+            claude_notes = core.row_notes(core.bucket_stats(next(iter(stats["buckets"].values()))))
+            check(
+                "claude: the row says TTFT includes hidden thinking",
+                any(f"~{HIDDEN} thinking tokens" in n for n in claude_notes),
+                str(claude_notes),
+            )
 
         print("report pipeline:")
         run_dir = Path(tempfile.mkdtemp(prefix="tps-selftest-"))
@@ -772,7 +902,7 @@ async def main() -> int:
         warm_payload = json.loads(
             tps(["run", "-c", "warm.toml", "-o", "warm", "--json"], work).stdout or "{}"
         )
-        warm_caps = [cap for model, cap in SEEN if model == "warm-model"]
+        warm_caps = [cap for model, cap, _temp in SEEN if model == "warm-model"]
         check(
             "warm-ups are capped; measured requests keep the prompt's max_tokens",
             warm_caps == [core.WARMUP_MAX_TOKENS] * 2 + [256],
@@ -873,6 +1003,112 @@ async def main() -> int:
             "remote --base-url without a key exits 2 and says how to pass one",
             unkeyed.returncode == 2 and "--api-key-env" in unkeyed.stderr,
             unkeyed.stderr[-200:],
+        )
+
+        claude_env = {"TPS_SELFTEST_CLAUDE_KEY": "sk-ant-oat01-selftest-subscription"}
+        claude_run = tps(
+            [
+                "run",
+                "--api",
+                "anthropic",
+                "--base-url",
+                base,
+                "--model",
+                "claude-sim",
+                "--api-key-env",
+                "TPS_SELFTEST_CLAUDE_KEY",
+                "--reps",
+                "2",
+                "-o",
+                "claude",
+                "--json",
+            ],
+            work,
+            env_extra=claude_env,
+        )
+        claude_payload = json.loads(claude_run.stdout or "{}")
+        claude_row = (claude_payload.get("results") or [{}])[0]
+        claude_md = (work / "claude" / "report.md").read_text(encoding="utf-8")
+        check(
+            "run --api anthropic: real streaming path end to end",
+            claude_run.returncode == 0
+            and claude_row.get("ok") == 2
+            and claude_row.get("hidden_reasoning_tokens_median") == HIDDEN
+            and any("thinking tokens" in n for n in claude_row.get("notes", [])),
+            claude_run.stderr[-300:] or str(claude_row)[:300],
+        )
+        check(
+            "run --api anthropic: saved config and report say what was sent",
+            core.load_config(work / "claude" / "targets.toml").targets[0].api == "anthropic"
+            and "temp not sent" in claude_md,
+            claude_md[:300],
+        )
+        for argv, code, why in (
+            (
+                ["run", "--api", "anthropic", "--model", "m"],
+                2,
+                "Claude API default URL needs a key",
+            ),
+            (["run", "--api", "openai", "--model", "m"], 1, "--api openai without --base-url"),
+            (["run", "-c", "local.toml", "--api", "anthropic"], 1, "-c with --api"),
+            (["run", "--base-url", base, "--model", "m", "--api", "x"], 1, "an unknown --api"),
+            (["run", "-c", "local.toml", "--temperature", "warm"], 1, "a non-numeric temperature"),
+        ):
+            got = tps(argv, work)
+            check(
+                f"exit {code}: {why}",
+                got.returncode == code,
+                f"{got.returncode} {got.stderr[-160:]}",
+            )
+        (work / "omit.toml").write_text(
+            '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("omit", base, "omit-model"),
+            encoding="utf-8",
+        )
+        tps(["run", "-c", "omit.toml", "-o", "omit", "--temperature", "omit"], work)
+        tps(["run", "-c", "omit.toml", "-o", "omit0"], work)
+        omit_seen = [sent for model, _cap, sent in SEEN if model == "omit-model"]
+        check(
+            "--temperature omit leaves it out; the OpenAI default still sends 0",
+            omit_seen == [False, True],
+            str(omit_seen),
+        )
+        (work / "reserved.toml").write_text(
+            target_block("r", base, "test-model", "extra_body = { max_tokens = 4096 }"),
+            encoding="utf-8",
+        )
+        reserved = tps(["run", "-c", "reserved.toml", "--dry-run"], work)
+        check(
+            "extra_body can't override the token cap (it would defeat --dry-run and warm-ups)",
+            reserved.returncode == 1 and "extra_body can't set max_tokens" in reserved.stderr,
+            reserved.stderr[-200:],
+        )
+        (work / "fp_claude.toml").write_text(
+            '[run]\nprompts = ["prose-256"]\n\n'
+            + "".join(
+                target_block(
+                    name, base, model, 'api = "anthropic"\napi_key_env = "TPS_SELFTEST_CLAUDE_KEY"'
+                )
+                for name, model in (
+                    ("opus", "claude-sim"),
+                    ("sonnet", "claude-sim"),
+                    ("tight", "claude-capped"),
+                )
+            ),
+            encoding="utf-8",
+        )
+        fp_claude = tps(
+            ["fingerprint", "-c", "fp_claude.toml", "-o", "fpc", "--prompt-count", "1", "--json"],
+            work,
+            env_extra=claude_env,
+        )
+        fpc = json.loads(fp_claude.stdout or "{}")
+        check(
+            "fingerprint on the Claude API: text mode; thinking that ate the cap is no_data",
+            fpc.get("verdict") == "consistent"
+            and fpc.get("no_data", {}).get("tight", "").startswith("no_answer")
+            and fpc.get("self_agreement", {}).get("opus") == 1.0,
+            fp_claude.stdout[:300] or fp_claude.stderr[-300:],
         )
 
         print("dry run:")

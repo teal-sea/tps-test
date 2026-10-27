@@ -56,6 +56,7 @@ Exit 0 when every critical check passes, 2 when only credentials are missing,
 ```bash
 tps init [--out targets.toml] [--force]
 tps init --endpoint URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,OUT]
+tps init --api anthropic --model claude-opus-5-5 --api-key-env ANTHROPIC_API_KEY
 tps init --model SLUG
 ```
 
@@ -95,6 +96,7 @@ tps run [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4,16]
         [--prompts name,other] [--max-tokens N] [--temperature T] [--timeout S]
         [--dry-run] [--mock] [--no-warmup]
 tps run --base-url URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,OUT] [...]
+tps run --api anthropic --model ID --api-key-env VAR [...]      # native Claude API
 ```
 
 | Flag | Default | Notes |
@@ -105,7 +107,7 @@ tps run --base-url URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,
 | `--concurrency` | from config (`[1]`) | comma list of integers ≥ 1; each level adds a batch per rep |
 | `--prompts` | from config | any built-in or `[prompts.*]` name |
 | `--max-tokens` | from each prompt | overrides every selected prompt's cap; raise it for reasoning models |
-| `--temperature` | from config (0) | ≥ 0 |
+| `--temperature` | from config (0; not sent to the Claude API) | a number ≥ 0, or `omit` to leave the field out |
 | `--timeout` | from config (180) | per-request seconds |
 | `--dry-run` | off | print the plan — requests, tokens, worst-case cost, rough time — and send nothing |
 | `--mock` | off | synthesises samples; no network; flagged in every output |
@@ -114,7 +116,10 @@ tps run --base-url URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,
 **No config file:** `--base-url URL --model ID` measures one OpenAI-compatible
 endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 --endpoint`; it can't be combined with `-c`). The generated config is saved as
-`<run_dir>/targets.toml`, so the run can be repeated or extended.
+`<run_dir>/targets.toml`, so the run can be repeated or extended. `--api
+anthropic` speaks the native Claude Messages API instead (URL defaults to
+`https://api.anthropic.com/v1`; takes API keys and Claude subscription tokens) —
+see [configuration](configuration.md#claude-api-anthropic).
 
 Cost model: requests = targets × prompts × reps × Σ(concurrency), plus
 `warmup` per target. A curated 11-target run at 1 prompt, 7 reps, concurrency
@@ -194,7 +199,7 @@ usage errors name the subcommand in `"command"`.
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
     "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
-    "truncated": 7, "reasoning_only": 0, "notes": [],
+    "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 34, "n": 35, "errors": {"rate_limited": 1},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {
@@ -222,6 +227,9 @@ normally everything; `reasoning_only` is the one to watch. When it is non-zero,
 `notes` says what that does to the row — e.g. a reasoning model that spent its
 whole cap thinking has a real TTFT and tok/s *for the thinking*, and no
 first-answer time or ITL; raise `--max-tokens`.
+`hidden_reasoning_tokens_median` is reasoning the provider billed but didn't
+stream (Claude's thinking); it is excluded from tok/s, and `notes` says TTFT
+includes it.
 
 ### `run --dry-run`
 

@@ -10,7 +10,7 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `reps` | `7` | repetitions per prompt × concurrency × target |
 | `concurrency` | `[1]` | list of parallel-request levels |
 | `warmup` | `2` | discarded requests per target (TLS, cold start), capped at 16 output tokens |
-| `temperature` | `0.0` | keep at 0 for comparability; `--temperature` overrides |
+| `temperature` | `0` (not sent to the Claude API) | a number, or `"omit"`; `--temperature` overrides |
 | `timeout_s` | `180` | per-request read timeout; `--timeout` overrides |
 | `prompts` | your `[prompts.*]`, else the first two built-ins | any built-in or `[prompts.*]` name |
 | `baseline` | none | target name to compute Δ columns against (must exist) |
@@ -22,12 +22,13 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | Key | Required | Notes |
 |---|---|---|
 | `name` | yes | shows up in reports; must be unique (every statistic is keyed by it) — keep it stable across runs |
-| `base_url` | yes | OpenAI-compatible root; `/chat/completions` is appended |
+| `base_url` | yes | API root; `/chat/completions` is appended (`/messages` with `api = "anthropic"`) |
 | `model` | yes | provider's model id, not your alias |
+| `api` | no | `"openai"` (default, any OpenAI-compatible server) or `"anthropic"` (the native Claude API — see below) |
 | `api_key_env` | no* | env var holding the key |
 | `api_key` | no* | literal key (avoid; use `api_key_env`) |
 | `headers` | no | extra request headers |
-| `extra_body` | no | merged into the JSON body — this is where pinning lives |
+| `extra_body` | no | merged into the JSON body — this is where pinning lives. It can't set `model`, `messages`, `stream` or the token cap: `tps` controls those, and an override would silently change what is measured and what `--dry-run` budgets |
 | `price` | no | `{ in_per_1m, out_per_1m }` in USD for cost columns; must be numbers |
 | `max_tokens_field` | no | per-target override |
 | `stream_options` | no | per-target override |
@@ -38,6 +39,41 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 `reps`, `concurrency` and `warmup` are validated up front: a config that would
 measure nothing (0 reps, concurrency 0, unknown prompt, duplicate names) is
 rejected before any request is sent.
+
+## Claude (`api = "anthropic"`)
+
+```toml
+[[targets]]
+name = "claude-opus-5-5"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-opus-5-5"
+api = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+price = { in_per_1m = 4.0, out_per_1m = 20.0 }
+```
+
+Or with no file: `tps run --api anthropic --model claude-opus-5-5 --api-key-env
+ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
+
+- **Native, not the OpenAI-compatible layer.** Anthropic also serves
+  `/v1/chat/completions`, but only for API keys; Claude subscription (OAuth)
+  tokens are rejected there. The native API takes both: an `sk-ant-api…` key is
+  sent as `x-api-key`, anything else as a bearer token.
+- **No `temperature`.** Claude 4.7 and later reject sampling parameters, so it
+  isn't sent to `api = "anthropic"` targets unless you set a number explicitly.
+  (On the OpenAI-compatible layer they reject `temperature: 0` too — use
+  `--temperature omit` there.)
+- **Hidden thinking.** Current Claude models think before answering and don't
+  stream the thinking. `tps` reads `usage.output_tokens_details.thinking_tokens`,
+  keeps those tokens out of tok/s, and notes that TTFT includes them. At the
+  built-in prompts' 256-token cap Claude Opus 5.5 usually spends the whole cap
+  thinking — `--max-tokens 2048`.
+- **Fingerprinting** compares whole texts: there are no logprobs and no greedy
+  decoding, so Claude normally shows up as `noisy` and can't decide a verdict.
+
+`[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
+get `0` and Claude API targets get nothing; `meta.json` records what each target
+was actually sent.
 
 ## Pinning an upstream
 

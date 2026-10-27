@@ -28,6 +28,7 @@ from .ui import UI, Bar, Col, Progress
 
 SCHEMA_VERSION = 1
 CONFIG_CANDIDATES = ("targets.toml", "targets.gateway.toml")
+CLAUDE_API_URL = "https://api.anthropic.com/v1"
 
 STARTER_CONFIG = """\
 # tps config — one [[targets]] block per upstream you want to measure.
@@ -131,6 +132,10 @@ def endpoint_config(url: str | None, args: argparse.Namespace, flag: str) -> str
     extras = {"--api-key-env": args.api_key_env, "--name": args.name, "--price": args.price}
     if flag == "--base-url":
         extras["--model"] = args.model
+    if url is None and args.api == "anthropic":
+        url = CLAUDE_API_URL  # `--api anthropic` alone means Anthropic's own endpoint
+    elif url is None and args.api is not None:
+        extras["--api"] = args.api
     if url is None:
         stray = [name for name, value in extras.items() if value is not None]
         if stray:
@@ -146,6 +151,7 @@ def endpoint_config(url: str | None, args: argparse.Namespace, flag: str) -> str
         args.api_key_env,
         _price_pair(args.price),
         source=f"tps {args.command} {flag}",
+        api=args.api or "openai",
     )
 
 
@@ -247,7 +253,8 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "out_tokens_median": st["out_tokens_median"],
                 "truncated": st["truncated"],
                 "reasoning_only": st["reasoning_only"],
-                "notes": [note] if (note := core.reasoning_note(st)) else [],
+                "hidden_reasoning_tokens_median": st["hidden_reasoning_tokens_median"],
+                "notes": core.row_notes(st),
                 "ok": total["ok"],
                 "n": total["n"],
                 "errors": total["errors"],
@@ -469,8 +476,11 @@ def print_fingerprint(
         letters = "ABCDEFGHIJKL"
         name_w = min(26, max(len(t) for t in present))
         label_w = name_w + 4
-        width = label_w + 5 * len(present) + 1
+        grid = label_w + 5 * len(present) + 1
         title = f" agreement · {prompt} · % identical tokens "
+        plain = "■ ≥99  ■ 90–99  ■ 50–90  ■ <50  ■ self"
+        # a two-target grid is narrower than its own title and legend
+        width = max(grid, len(title) + 1, len(plain) + 2)
         ui.say()
         ui.say(ui.grey("╭─") + ui.bold(title) + ui.grey("─" * max(0, width - len(title) - 1) + "╮"))
         head = " " * label_w + "".join(f"{letters[i]:>4} " for i in range(len(present)))
@@ -487,7 +497,8 @@ def print_fingerprint(
                 )
                 cells.append(ui.heat(frac))
             colour = ui.group(group_of.get(a_name, 0))
-            ui.say(ui.grey("│") + colour(label) + "".join(cells) + " " + ui.grey("│"))
+            pad = " " * (1 + width - grid)
+            ui.say(ui.grey("│") + colour(label) + "".join(cells) + pad + ui.grey("│"))
         swatch = lambda code, text: ui.style("■", code) + " " + ui.grey(text)  # noqa: E731
         legend = "  ".join(
             [
@@ -498,7 +509,6 @@ def print_fingerprint(
                 swatch("\033[38;5;238m", "self"),
             ]
         )
-        plain = "■ ≥99  ■ 90–99  ■ 50–90  ■ <50  ■ self"
         ui.say(ui.grey("├" + "─" * width + "┤"))
         ui.say(ui.grey("│") + " " + legend + " " * max(0, width - len(plain) - 1) + ui.grey("│"))
         ui.say(ui.grey("╰" + "─" * width + "╯"))
@@ -677,9 +687,9 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     ui.header("init")
     ui.say()
     if text is not None:
-        core.config_from_text(text, "--endpoint")  # same checks as loading it later
+        url = core.config_from_text(text, "--endpoint").targets[0].base_url  # validates too
         out.write_text(text, encoding="utf-8")
-        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} at {args.endpoint_url}")
+        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} at {url}")
         export = f"export {args.api_key_env}=… && " if args.api_key_env else ""
         ui.hint(f"  next → {export}tps run -c {out} --dry-run   (then without --dry-run)")
         return {
@@ -688,7 +698,7 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             "config": str(out),
             "model": args.model,
             "targets": 1,
-            "endpoint": args.endpoint_url,
+            "endpoint": url,
         }
     if args.model:
         canonical, endpoints, _payload = core.fetch_endpoints(
@@ -874,8 +884,8 @@ def run_plan(
 
 
 def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
-    if args.endpoint_url and args.config:
-        raise core.UsageError("pass either -c FILE or --base-url, not both")
+    if args.config and (args.endpoint_url or args.api):
+        raise core.UsageError("pass either -c FILE or --base-url/--api, not both")
     text = endpoint_config(args.endpoint_url, args, "--base-url")
     if text is None:
         path: Path | None = resolve_config(args.config)
@@ -1016,9 +1026,11 @@ def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     prompt_count = min(args.prompt_count, len(cfg.prompts))
     total = prompt_count * args.reps * len(cfg.targets)
     ui.header("fingerprint", _models_label(cfg), mock=args.mock)
+    claude = [t.name for t in cfg.targets if t.api == "anthropic"]
+    decoding = "greedy" if not claude else "greedy where allowed (Claude API: sampled)"
     ui.hint(
         f"  {_n(len(cfg.targets), 'target')} · {_n(prompt_count, 'prompt')} · {_n(args.reps, 'rep')} · "
-        f"greedy, {args.max_tokens} tokens · {total} requests"
+        f"{decoding}, {args.max_tokens} tokens · {total} requests"
     )
 
     with Progress(ui, total) as progress:
@@ -1111,6 +1123,13 @@ def build_parser() -> argparse.ArgumentParser:
                 else f"with {flag}: the model id there; alone: OpenRouter slug to discover"
             ),
         )
+        p.add_argument(
+            "--api",
+            choices=core.APIS,
+            default=None,
+            help=f"wire format (default openai); anthropic = native Claude API, {CLAUDE_API_URL} "
+            "unless a URL is given — accepts API keys and Claude subscription tokens",
+        )
         p.add_argument("--api-key-env", default=None, help="env var holding the key")
         p.add_argument("--name", default=None, help="target name (default: the host)")
         p.add_argument("--price", default=None, metavar="IN,OUT", help="USD per 1M tokens")
@@ -1147,7 +1166,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--max-tokens", type=int, default=None, help="override every prompt's max_tokens"
     )
-    p_run.add_argument("--temperature", type=float, default=None)
+    p_run.add_argument(
+        "--temperature",
+        default=None,
+        help='a number, or "omit" to not send it (default: 0; not sent to the Claude API)',
+    )
     p_run.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
     p_run.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
     p_run.add_argument("--no-warmup", action="store_true")

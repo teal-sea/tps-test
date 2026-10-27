@@ -30,6 +30,9 @@ First public release.
   --timeout`) override the config.
 - `finish_reason` and reasoning-token counts are recorded; results carry
   `truncated`, `reasoning_only` and `notes`.
+- Native Claude API targets (`api = "anthropic"`, `--api anthropic`): works with
+  API keys and Claude subscription tokens, which Anthropic's OpenAI-compatible
+  endpoint rejects. `--temperature omit` / `temperature = "omit"`.
 
 ### Fixed before release
 
@@ -43,6 +46,13 @@ First public release.
 - `raw.jsonl` didn't say which rows were warm-ups (only `batch: -1`); every row
   now has `phase`, and run JSON labels `total` / `warmup_requests` /
   `planned_requests`.
+- Found by benchmarking Claude Opus 5.5: every request sent `temperature: 0`,
+  which Claude 4.7+ rejects; reasoning that was billed but never streamed was
+  credited to tok/s (up to 40% too fast), and a response whose hidden thinking
+  used the whole cap was counted as a failed `empty_stream`.
+- `extra_body` could override the token cap, making `--dry-run` understate cost
+  and defeating the warm-up cap; tps-controlled fields are now rejected there.
+- The fingerprint agreement box overflowed with only two targets.
 - The selftest's no-buffering check used a wall-clock budget that a cold first
   connection could exceed; it now compares against the same request's end. A
   missing dependency prints setup steps instead of a traceback.
