@@ -53,6 +53,10 @@ First public release.
 - `extra_body` could override the token cap, making `--dry-run` understate cost
   and defeating the warm-up cap; tps-controlled fields are now rejected there.
 - The fingerprint agreement box overflowed with only two targets.
+- A stream coalesced by a proxy showed a 1 ms ITL next to 138 tok/s with nothing
+  saying why, and won "best ITL". Bursty delivery is now detected (median gap <
+  20% of the mean), marked `†`, noted, and excluded from "best"; rows gain
+  `tokens_per_chunk_median`, `bursty`, `itl_n` and `first_content_n`.
 - The selftest's no-buffering check used a wall-clock budget that a cold first
   connection could exceed; it now compares against the same request's end. A
   missing dependency prints setup steps instead of a traceback.

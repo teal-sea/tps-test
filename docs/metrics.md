@@ -46,7 +46,20 @@ terrible ITL, or the reverse.
 Caveat: many providers coalesce several tokens into one SSE chunk. A chunk is not
 a token, so ITL here is really "chunk inter-arrival", which is what a user
 perceives anyway. It is not comparable to a per-token ITL measured from raw
-logits.
+logits. **tok/chunk** (`tokens_per_chunk_median`) says how many tokens each chunk
+carried, which is what reconciles the two: 3.7 tokens/chunk every 20 ms is
+~180 tok/s.
+
+**Bursts.** A proxy or gateway that buffers the stream can deliver chunks in
+clumps — many arriving back to back, then a pause. The median gap then lands
+inside a clump (≈1 ms) and describes the proxy's flushing, not the model: 1 ms
+ITL next to 138 tok/s is not a contradiction you should resolve by believing
+either. `tps` flags a request as **bursty** when its median gap is under 20% of
+its mean gap — a comparison of the stream with itself, so it needs no token
+counts. Bursty rows are marked `†`, never win "best ITL", carry a note, and are
+counted in `bursty` (with `itl_n`, the number of requests the ITL median came
+from). No client-side measurement can recover the model's pacing from a
+coalesced stream.
 
 ## tok/s — per-stream decode rate
 

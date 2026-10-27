@@ -484,6 +484,10 @@ class Sample:
     out_tps: float | None = None
     itl_p50_ms: float | None = None
     itl_p90_ms: float | None = None
+    # A median gap far below the mean means chunks arrived in bursts (a proxy
+    # flushing several at once): the ITL then measures delivery, not the model.
+    itl_mean_ms: float | None = None
+    tokens_per_chunk: float | None = None
     chunks: int = 0
     count_source: str = "usage"
     served_by: str | None = None
@@ -699,6 +703,9 @@ async def stream_once(
         if gaps:
             sample.itl_p50_ms = percentile(gaps, 0.5) * 1000
             sample.itl_p90_ms = percentile(gaps, 0.9) * 1000
+            sample.itl_mean_ms = sum(gaps) / len(gaps) * 1000
+    if sample.chunks and streamed > 0:
+        sample.tokens_per_chunk = streamed / sample.chunks
     # A single chunk has no decode window: the rate is unknown, not infinite.
 
     # Billed tokens and a finish_reason but nothing streamed is a model that
@@ -851,6 +858,8 @@ def mock_sample(
         out_tps=(tokens - 1) / decode,
         itl_p50_ms=itl * 1000,
         itl_p90_ms=itl * 1000 * 1.4,
+        itl_mean_ms=itl * 1000 * 1.1,  # a steady stream: one token per chunk
+        tokens_per_chunk=1.0,
         chunks=tokens,
         count_source="mock",
         served_by=target.note() or "mock",
@@ -1119,6 +1128,7 @@ def _bucket() -> dict[str, Any]:
         "e2e": [],
         "tps": [],
         "itl": [],
+        "tpc": [],
         "in": [],
         "out": [],
         "batches": [],
@@ -1126,6 +1136,7 @@ def _bucket() -> dict[str, Any]:
         "n": 0,
         "truncated": 0,
         "reasoning_only": 0,
+        "bursty": 0,
         "hidden": [],
         "errors": {},
         "served": set(),
@@ -1139,9 +1150,19 @@ _FIELDS = (
     ("e2e", "e2e_s"),
     ("tps", "out_tps"),
     ("itl", "itl_p50_ms"),
+    ("tpc", "tokens_per_chunk"),
     ("in", "in_tokens"),
     ("out", "out_tokens"),
 )
+
+# A request whose median chunk gap is under this share of its mean gap got its
+# chunks in bursts. Comparing the stream with itself needs no token counts.
+BURST_RATIO = 0.2
+
+
+def is_bursty(sample: dict[str, Any]) -> bool:
+    p50_gap, mean_gap = sample.get("itl_p50_ms"), sample.get("itl_mean_ms")
+    return bool(p50_gap is not None and mean_gap and p50_gap < BURST_RATIO * mean_gap)
 
 
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1177,6 +1198,7 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
             # every chunk was reasoning: there is no answer to time
             bucket["reasoning_only"] += s.get("first_content_s") is None
             bucket["hidden"].append(s.get("hidden_reasoning_tokens") or 0)
+            bucket["bursty"] += is_bursty(s)
             for name, source in _FIELDS:
                 bucket[name].append(s.get(source))
             batch_tokens[bkey] = batch_tokens.get(bkey, 0) + (s.get("out_tokens") or 0)
@@ -1207,6 +1229,12 @@ def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         "out_tps_p50": p50(bucket["tps"]),
         "out_tps_p90": p90(bucket["tps"], higher_is_better=True),
         "itl_p50_ms": p50(bucket["itl"]),
+        # how many samples each median actually came from: reasoning-only and
+        # single-chunk responses have no first answer / no ITL to contribute
+        "itl_n": sum(v is not None for v in bucket["itl"]),
+        "first_content_n": sum(v is not None for v in bucket["first_content"]),
+        "tokens_per_chunk_median": median(bucket["tpc"]),
+        "bursty": bucket["bursty"],
         "e2e_p50_s": p50(bucket["e2e"]),
         "out_tokens_median": median(bucket["out"]),
         "in_tokens_median": median(bucket["in"]),
@@ -1233,8 +1261,8 @@ def reasoning_note(st: dict[str, Any]) -> str | None:
         return None
     if only < ok:
         return (
-            f"{only}/{ok} responses were reasoning only (no answer text); "
-            "first answer and ITL cover the rest"
+            f"{only}/{ok} responses were reasoning only (no answer text); first answer "
+            f"is from {st['first_content_n']} and ITL from {st['itl_n']} of {ok}"
         )
     if st["truncated"] == ok:
         return (
@@ -1256,6 +1284,13 @@ def row_notes(st: dict[str, Any]) -> list[str]:
         notes.append(
             f"TTFT includes ~{hidden:.0f} thinking tokens (median) that the API doesn't "
             "stream; tok/s counts only the streamed answer"
+        )
+    if st["bursty"]:
+        tpc = st["tokens_per_chunk_median"]
+        notes.append(
+            f"chunks arrived in bursts in {st['bursty']}/{st['itl_n']} responses (median gap "
+            f"under {BURST_RATIO:.0%} of the mean) — ITL measures how the stream was "
+            "flushed, not the model's pacing" + (f" ({tpc:.1f} tokens/chunk)" if tpc else "")
         )
     return notes
 
@@ -1346,7 +1381,9 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
     lines.append(
         "TTFT = time to the first generated token (content or reasoning). "
         "tok/s = per-stream decode rate across the streaming window. ITL = median gap "
-        "between content chunks. **p90 is always the slow tail** (for tok/s, the rate 90% "
+        "between content chunks; tok/chunk shows how many tokens each chunk carried, and "
+        "† marks streams that arrived in bursts, where ITL reflects flushing rather than "
+        "the model. **p90 is always the slow tail** (for tok/s, the rate 90% "
         "of requests met or beat). Aggregate = all tokens of a concurrent batch ÷ its wall "
         "clock. Definitions: `docs/metrics.md`."
     )
@@ -1379,7 +1416,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
         header = ["provider", "TTFT p50", "TTFT p90"]
         if show_first:
             header.append("first answer p50")
-        header += ["tok/s p50", "tok/s p90", "ITL p50 ms", "E2E p50", "out tok", "ok"]
+        header += ["tok/s p50", "tok/s p90", "ITL p50 ms", "tok/chunk", "E2E p50", "out tok", "ok"]
         if show_delta:
             header += [f"Δ TTFT vs {base_name}", f"Δ tok/s vs {base_name}"]
         lines.append("| " + " | ".join(header) + " |")
@@ -1396,7 +1433,8 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
             cells += [
                 fmt(st["out_tps_p50"]) + mark,
                 fmt(st["out_tps_p90"]) + mark,
-                fmt(st["itl_p50_ms"]),
+                fmt(st["itl_p50_ms"]) + (" †" if st["bursty"] else ""),
+                fmt(st["tokens_per_chunk_median"]),
                 fmt(st["e2e_p50_s"], 2),
                 fmt(st["out_tokens_median"], 0),
                 f"{st['ok']}/{st['n']}",
@@ -1574,6 +1612,9 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                 "served_by",
                 "truncated",
                 "reasoning_only",
+                "itl_n",
+                "tokens_per_chunk_median",
+                "bursty",
             ]
         )
         for (prompt, target, conc), bucket in sorted(buckets.items()):
@@ -1599,6 +1640,9 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                     ";".join(st["served_by"]),
                     st["truncated"],
                     st["reasoning_only"],
+                    st["itl_n"],
+                    fmt(st["tokens_per_chunk_median"], 2),
+                    st["bursty"],
                 ]
             )
 

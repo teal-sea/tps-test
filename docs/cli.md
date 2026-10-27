@@ -198,7 +198,9 @@ usage errors name the subcommand in `"command"`.
     "concurrency": 1,
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
-    "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
+    "itl_p50_ms": 12.0, "itl_n": 7, "first_content_n": 7,
+    "tokens_per_chunk_median": 1.0, "bursty": 0,
+    "e2e_p50_s": 3.2, "out_tokens_median": 240,
     "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 34, "n": 35, "errors": {"rate_limited": 1},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
@@ -230,6 +232,13 @@ first-answer time or ITL; raise `--max-tokens`.
 `hidden_reasoning_tokens_median` is reasoning the provider billed but didn't
 stream (Claude's thinking); it is excluded from tok/s, and `notes` says TTFT
 includes it.
+
+`itl_n` / `first_content_n` are how many requests those medians came from
+(reasoning-only and single-chunk responses contribute nothing). `bursty` counts
+requests whose chunks arrived in clumps (median gap < 20% of the mean): their ITL
+measures a proxy's flushing, not the model — see
+[metrics](metrics.md#itl-inter-token-latency). `tokens_per_chunk_median` is what
+reconciles ITL with tok/s.
 
 ### `run --dry-run`
 

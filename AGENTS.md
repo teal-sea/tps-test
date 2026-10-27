@@ -91,7 +91,9 @@ on **stdout** and exit non-zero.
     "concurrency": 1,
     "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
-    "itl_p50_ms": 12.0, "e2e_p50_s": 3.2, "out_tokens_median": 240,
+    "itl_p50_ms": 12.0, "itl_n": 7, "first_content_n": 7,
+    "tokens_per_chunk_median": 1.0, "bursty": 0,
+    "e2e_p50_s": 3.2, "out_tokens_median": 240,
     "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 35, "n": 35, "errors": {},
     "aggregate_tps": {"1": 78.1, "4": 240.5},
@@ -114,6 +116,11 @@ model that hit `max_tokens` while thinking (`truncated` counts
 `first_content_p50_s`/`itl_p50_ms` are null and TTFT/tok/s time the *thinking*;
 `notes` says so. Re-run with a larger `--max-tokens`; don't report those rates as
 answer speed.
+
+`bursty` > 0 means chunks arrived in clumps (median gap < 20% of the mean), so
+`itl_p50_ms` measures a proxy's flushing, not the model — don't rank providers
+on it. `itl_n` / `first_content_n` give the sample count behind those medians;
+`tokens_per_chunk_median` reconciles ITL with tok/s.
 
 `run --dry-run` sends nothing and adds `dry_run: true`, `plan{requests,
 measured_requests, warmup_requests, in_tokens_est, out_tokens_max, cost_max_usd,

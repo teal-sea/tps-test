@@ -155,6 +155,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._emit({"choices": [], "usage": usage})
             self._done()
             return
+        if model == "bursty":
+            # a proxy coalescing the stream: 8 flushes of 4 one-token chunks
+            time.sleep(FIRST_DELAY)
+            for burst in range(TOKENS // 4):
+                for i in range(4):
+                    self._emit({"choices": [{"delta": {"content": f"tok{burst * 4 + i} "}}]})
+                time.sleep(4 * TOKEN_DELAY)
+            if want_usage:
+                self._emit(
+                    {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": TOKENS}}
+                )
+            self._done()
+            return
         if model == "midstream-error":
             for i in range(5):
                 self._emit({"choices": [{"delta": {"content": f"tok{i} "}}]})
@@ -516,6 +529,34 @@ async def main() -> int:
                 note_for(capped, reasoning),
             )
             check("answered row has no note", note_for(reasoning) == "", note_for(reasoning))
+
+            print("chunk delivery (ITL honesty):")
+            burst = await once(tgt("bursty"))
+            check(
+                "bursty delivery detected (median gap far below the mean)",
+                core.is_bursty(burst.as_dict()) and burst.tokens_per_chunk == 1.0,
+                f"p50={burst.itl_p50_ms} mean={burst.itl_mean_ms} tpc={burst.tokens_per_chunk}",
+            )
+            check(
+                "a steady stream is not flagged",
+                not core.is_bursty(sample.as_dict()),
+                f"p50={sample.itl_p50_ms} mean={sample.itl_mean_ms}",
+            )
+            check(
+                "tokens per chunk counts what each chunk carried",
+                big.tokens_per_chunk == BIG_CHUNK,
+                str(big.tokens_per_chunk),
+            )
+            burst_stats = core.bucket_stats(
+                next(iter(core.summarize([burst.as_dict()])["buckets"].values()))
+            )
+            check(
+                "a bursty row says its ITL measures flushing, not the model",
+                any("arrived in bursts" in n for n in core.row_notes(burst_stats))
+                and burst_stats["bursty"] == 1
+                and burst_stats["itl_n"] == 1,
+                str(core.row_notes(burst_stats)),
+            )
 
             print("native Claude API (hidden thinking, no sampling params):")
             claude_key = "sk-ant-api03-selftest-0123456789"
@@ -1171,8 +1212,39 @@ async def main() -> int:
             capped_row.get("reasoning_only") == 2
             and capped_row.get("truncated") == 2
             and capped_row.get("itl_p50_ms") is None
+            and capped_row.get("itl_n") == 0
+            and capped_row.get("first_content_n") == 0
             and "measured thinking" in " ".join(capped_row.get("notes", [])),
-            str({k: capped_row.get(k) for k in ("reasoning_only", "truncated", "notes")}),
+            str({k: capped_row.get(k) for k in ("reasoning_only", "truncated", "itl_n", "notes")}),
+        )
+        (work / "bursty.toml").write_text(
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + target_block("coalesced", base, "bursty")
+            + target_block("steady", base, "test-model"),
+            encoding="utf-8",
+        )
+        bursty_payload = json.loads(
+            tps(["run", "-c", "bursty.toml", "-o", "bursty", "--json"], work).stdout or "{}"
+        )
+        by_target = {r["target"]: r for r in bursty_payload.get("results", [])}
+        coalesced, steady = by_target.get("coalesced", {}), by_target.get("steady", {})
+        check(
+            "run JSON: bursty count, tokens/chunk and itl_n per row; steady stream unflagged",
+            coalesced.get("bursty") == 2
+            and coalesced.get("itl_n") == 2
+            and coalesced.get("tokens_per_chunk_median") == 1.0
+            and steady.get("bursty") == 0
+            and not any("bursts" in n for n in steady.get("notes", [])),
+            str({k: coalesced.get(k) for k in ("bursty", "itl_n", "tokens_per_chunk_median")}),
+        )
+        bursty_md = (work / "bursty" / "report.md").read_text(encoding="utf-8")
+        coalesced_line = next(
+            (line for line in bursty_md.splitlines() if line.startswith("| coalesced |")), ""
+        )
+        check(
+            "report.md marks the bursty ITL and explains it",
+            " †" in coalesced_line and "arrived in bursts" in bursty_md,
+            coalesced_line,
         )
         check(
             "report.md and the terminal say so too",

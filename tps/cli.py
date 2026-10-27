@@ -249,6 +249,10 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "out_tps_p50": _r(st["out_tps_p50"], 2),
                 "out_tps_p90": _r(st["out_tps_p90"], 2),
                 "itl_p50_ms": _r(st["itl_p50_ms"], 2),
+                "itl_n": st["itl_n"],
+                "first_content_n": st["first_content_n"],
+                "tokens_per_chunk_median": _r(st["tokens_per_chunk_median"], 2),
+                "bursty": st["bursty"],
                 "e2e_p50_s": _r(st["e2e_p50_s"]),
                 "out_tokens_median": st["out_tokens_median"],
                 "truncated": st["truncated"],
@@ -304,7 +308,8 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
     best_tps = _best(rows, lambda r: r["out_tps_p50"], lowest=False)
     best_ttft = _best(rows, lambda r: r["ttft_p50_s"], lowest=True)
-    best_itl = _best(rows, lambda r: r["itl_p50_ms"], lowest=True)
+    # a bursty ITL measures the proxy's flushing; it can't win "lowest ITL"
+    best_itl = _best(rows, lambda r: None if r["bursty"] else r["itl_p50_ms"], lowest=True)
     cheapest = _best(rows, lambda r: r["price_out_per_1m"], lowest=True)
 
     def mark(value, best):
@@ -316,6 +321,7 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
         Col("tok/s"),
         Col("", "l", flex=True),
         Col("itl", drop=1),
+        Col("tok/chunk", drop=5),
         Col("ok"),
         Col("$/1M out", drop=2),
     ]
@@ -335,7 +341,12 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
             (_secs(r["ttft_p50_s"]), mark(r["ttft_p50_s"], best_ttft)),
             (("≈" if est else "") + core.fmt(r["out_tps_p50"]), mark(r["out_tps_p50"], best_tps)),
             Bar(r["out_tps_p50"], peak, 24, ui.green if is_best else ui.cyan),
-            (_ms(r["itl_p50_ms"]), mark(r["itl_p50_ms"], best_itl)),
+            (
+                (_ms(r["itl_p50_ms"]) + "†", ui.yellow)
+                if r["bursty"]
+                else (_ms(r["itl_p50_ms"]), mark(r["itl_p50_ms"], best_itl))
+            ),
+            core.fmt(r["tokens_per_chunk_median"]),
             (f"{ok}/{n}", ok_style),
             (core.fmt(r["price_out_per_1m"], 2), mark(r["price_out_per_1m"], cheapest)),
         ]
@@ -359,6 +370,8 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     legend = "p50 · ttft first token · tok/s decode rate · itl gap between chunks"
     if estimated:
         legend += " · ≈ chars/4 estimate"
+    if any(r["bursty"] for r in rows):
+        legend += " · † chunks arrived in bursts"
     ui.say()
     ui.table(cols, table, title=title, footer=legend)
     for r in rows:
