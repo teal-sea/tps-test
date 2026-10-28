@@ -1442,6 +1442,16 @@ def bar(value: float, peak: float, width: int = 28) -> str:
 # --------------------------------------------------------------------------
 
 
+def model_ids(models: list[str | None]) -> list[str]:
+    return list(dict.fromkeys(model for model in models if model))
+
+
+def model_label(models: list[str]) -> str:
+    if len(models) == 1:
+        return models[0]
+    return f"{len(models)} model ids" if models else "?"
+
+
 def _ordered_targets(meta: dict[str, Any], keys) -> list[str]:
     names = [t["name"] for t in meta.get("targets", [])]
     for key in keys:
@@ -1477,7 +1487,8 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
             "> **PARTIAL** — the run was interrupted; tables cover only the requests that finished.",
             "",
         ]
-    model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
+    models = model_ids([t.get("model") for t in meta.get("targets", [])])
+    model = model_label(models)
     caps = sorted(set((meta.get("max_tokens") or {}).values()))
     cap = f" · max_tokens {'/'.join(map(str, caps))}" if caps else ""
     targets_meta = meta.get("targets", [])
