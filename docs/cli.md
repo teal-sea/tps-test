@@ -201,6 +201,7 @@ usage errors name the subcommand in `"command"`.
   "run_dir": "runs/2026-10-27T12-00-00Z",
   "config": "targets.toml",
   "model": "deepseek/deepseek-v4.1-flash",
+  "models": ["deepseek/deepseek-v4.1-flash"],
   "reps": 7, "concurrency": [1, 4],
   "results": [{
     "prompt": "prose-256", "target": "deepinfra", "model": "...",
@@ -225,6 +226,10 @@ usage errors name the subcommand in `"command"`.
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
 ```
+
+`model` remains the first target's model ID for compatibility. `models` is the
+ordered, deduplicated list of every model ID in the run, so mixed-model configs
+are unambiguous.
 
 Three counts, three meanings: `total` is measured requests (warm-ups excluded);
 `warmup_requests` were sent first and discarded; `planned_requests` is both
@@ -262,6 +267,7 @@ reconciles ITL with tok/s.
 ```json
 {"schema_version":1,"command":"run","ok":true,"dry_run":true,"mock":false,
  "config":"targets.toml","model":"deepseek/deepseek-v4.1-flash",
+ "models":["deepseek/deepseek-v4.1-flash"],
  "reps":7,"concurrency":[1,4],"prompts":["prose-256"],
  "plan":{"requests":407,"measured_requests":385,"warmup_requests":22,
    "in_tokens_est":24420,"in_tokens_max":110297,"out_tokens_max":98912,

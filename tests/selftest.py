@@ -1018,6 +1018,12 @@ async def main() -> int:
             payload.get("schema_version") == 1,
             result.stdout[:200],
         )
+        check(
+            "run JSON lists every model and preserves the legacy first-model field",
+            payload.get("models") == ["test-model", "rl-conc"]
+            and payload.get("model") == "test-model",
+            str({k: payload.get(k) for k in ("model", "models")}),
+        )
         rows = {r["target"]: r for r in payload.get("results", [])}
         limited = rows.get("limited", {})
         check(
@@ -1062,11 +1068,21 @@ async def main() -> int:
             report_run.returncode == 0 and "good" in report_run.stdout,
             report_run.stderr[-300:],
         )
+        check(
+            "mixed-model report command names the model count",
+            "2 model ids" in report_run.stdout,
+            report_run.stdout[:300],
+        )
         markdown = tps(["report", "out", "--markdown"], work)
         check(
             "report --markdown prints markdown",
             markdown.stdout.startswith("# tps report"),
             markdown.stdout[:80],
+        )
+        check(
+            "mixed-model markdown names the model count, not the first target",
+            "- model: `2 model ids`" in markdown.stdout,
+            markdown.stdout[:300],
         )
 
         bad_flag = tps(["run", "--json", "--reps", "abc"], work)
@@ -1434,6 +1450,12 @@ async def main() -> int:
             and plan.get("measured_requests") == 30
             and plan.get("warmup_requests") == 2,
             str({k: plan.get(k) for k in ("requests", "measured_requests", "warmup_requests")}),
+        )
+        check(
+            "dry-run JSON lists every model and preserves the legacy first-model field",
+            plan_payload.get("models") == ["m", "test-model"]
+            and plan_payload.get("model") == "m",
+            str({k: plan_payload.get(k) for k in ("model", "models")}),
         )
         check(
             "dry run: worst-case cost from max_tokens, unpriced targets listed, not guessed",

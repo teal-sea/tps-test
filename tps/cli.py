@@ -832,8 +832,7 @@ def _n(count: int, noun: str) -> str:
 
 
 def _models_label(cfg: core.RunConfig) -> str:
-    models = list(dict.fromkeys(t.model for t in cfg.targets))
-    return models[0] if len(models) == 1 else f"{len(models)} model ids"
+    return core.model_label(core.model_ids([t.model for t in cfg.targets]))
 
 
 def _k(tokens: int) -> str:
@@ -904,6 +903,7 @@ def run_plan(
         "mock": args.mock,
         "config": str(path) if path else None,
         "model": cfg.targets[0].model,
+        "models": core.model_ids([t.model for t in cfg.targets]),
         "reps": cfg.reps,
         "concurrency": cfg.concurrency,
         "prompts": list(cfg.prompts),
@@ -1002,6 +1002,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "run_dir": str(outdir),
         "config": str(path),
         "model": next((t["model"] for t in meta["targets"]), None),
+        "models": core.model_ids([t["model"] for t in meta["targets"]]),
         "reps": cfg.reps,
         "concurrency": cfg.concurrency,
         "results": summary["rows"],
@@ -1029,7 +1030,7 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         return {"command": "report", "ok": True, "run_dir": str(args.run_dir), "report": text}
 
     flags = " · partial" if meta.get("complete") is False else ""
-    model = next((t.get("model") for t in meta.get("targets", []) if t.get("model")), "?")
+    model = core.model_label(core.model_ids([t.get("model") for t in meta.get("targets", [])]))
     ui.header(
         "report",
         f"{args.run_dir} · {model} · {meta.get('created', '?')}{flags}",
