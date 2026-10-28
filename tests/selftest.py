@@ -1453,8 +1453,7 @@ async def main() -> int:
         )
         check(
             "dry-run JSON lists every model and preserves the legacy first-model field",
-            plan_payload.get("models") == ["m", "test-model"]
-            and plan_payload.get("model") == "m",
+            plan_payload.get("models") == ["m", "test-model"] and plan_payload.get("model") == "m",
             str({k: plan_payload.get(k) for k in ("model", "models")}),
         )
         check(
