@@ -42,7 +42,6 @@ PAGES = {
     "metrics.md": "Metrics",
     "methodology.md": "Methodology",
     "gateways.md": "Gateways",
-    "fingerprinting.md": "Fingerprinting",
     "automation.md": "Automation",
     "troubleshooting.md": "Troubleshooting",
     "faq.md": "FAQ",

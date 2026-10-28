@@ -4,8 +4,7 @@
 
 <p align="center">
   <b>Benchmark one LLM across every provider that serves it.</b><br>
-  Time-to-first-token · inter-token latency · tok/s · throughput under load · failures · cost —<br>
-  plus a fingerprint test for whether those providers are even serving the same weights.
+  Time-to-first-token · inter-token latency · tok/s · throughput under load · failures · cost.
 </p>
 
 <p align="center">
@@ -20,7 +19,6 @@
   <a href="docs/getting-started.md">Guide</a> ·
   <a href="docs/cli.md">CLI reference</a> ·
   <a href="docs/methodology.md">Methodology</a> ·
-  <a href="docs/fingerprinting.md">Fingerprinting</a> ·
   <a href="AGENTS.md">For agents</a>
 </p>
 
@@ -35,7 +33,7 @@ The same open-weights model is served by a dozen providers at a 30× price sprea
 Their dashboards report their own numbers, over their own window, from their own
 side of the network. **`tps` holds the model constant, swaps the upstream, and
 measures from where you sit** — streaming, interleaved, pinned to one upstream per
-row — then checks whether the cheap row is even the same artifact.
+row.
 
 ## Quick start
 
@@ -53,7 +51,6 @@ about 20 minutes and a few cents:
 export OPENROUTER_API_KEY=sk-or-...
 tps doctor -c targets.v4.1-flash.toml        # environment, config, credentials
 tps run -c targets.v4.1-flash.toml           # the measurement
-tps fingerprint -c targets.v4.1-flash.toml   # same weights, or just the same name?
 ```
 
 Your own endpoint, no OpenRouter and no config file:
@@ -79,21 +76,7 @@ reach every upstream with one key.
 | Which provider is fastest? Snappiest? Cheapest per real request? | `tps run` |
 | Does it scale, or just queue, when I send 16 at once? | `tps run --concurrency 1,16` |
 | What does the gateway hop cost me? | `tps run` with `baseline =` |
-| Are these providers serving the same weights? | `tps fingerprint` |
 | Did that provider get worse since last week? | `tps run` twice, diff `summary.csv` |
-
-## Is the cheap one the same model?
-
-A slug is not an artifact: behind one model name you'll find fp4, fp8 and
-endpoints that won't say. `tps fingerprint` decodes greedily at temperature 0,
-measures each provider's agreement with *itself* as a noise floor, compares
-providers token by token, and clusters them — with a verdict that never counts a
-failed request or a non-deterministic endpoint as evidence.
-
-<p align="center">
-  <img src="docs/assets/screenshot-fingerprint.svg" alt="tps fingerprint: an agreement heatmap between providers, a tokenizer-signature warning, three colour-coded groups, a non-deterministic gateway flagged as noisy, and a SPLIT verdict" width="100%">
-  <br><sub>Fictional providers, synthetic data: <code>tps fingerprint -c examples/fingerprint-demo.toml --mock</code></sub>
-</p>
 
 ## How it stays honest
 
@@ -126,7 +109,6 @@ exit codes (`0` ok · `1` usage · `2` credentials · `3` provider · `4` all fa
 
 ```bash
 tps run --json | jq '.results | sort_by(-.out_tps_p50) | .[:3] | .[] | {target, out_tps_p50, ttft_p50_s, ok, n}'
-tps fingerprint --json | jq '.verdict, .clusters'
 ```
 
 [AGENTS.md](AGENTS.md) is the dense contract for coding agents;
@@ -142,7 +124,6 @@ tps fingerprint --json | jq '.verdict, .clusters'
 | [Metrics](docs/metrics.md) | exact definition of every number |
 | [Methodology](docs/methodology.md) | what makes a comparison fair, and what silently invalidates one |
 | [Gateways](docs/gateways.md) | hop overhead vs routing choice vs gateway-vs-gateway |
-| [Fingerprinting](docs/fingerprinting.md) | detecting different weights behind the same model name |
 | [Automation](docs/automation.md) | CI, cron, `--json` contracts, agent usage |
 | [Troubleshooting](docs/troubleshooting.md) | the errors you will actually hit |
 | [FAQ](docs/faq.md) | short answers |
@@ -168,7 +149,7 @@ measurements so a blip doesn't get attributed to whoever ran first.
 tps/                 package: core.py (engine), cli.py (commands), ui.py (terminal)
 tests/selftest.py    offline checks against a local SSE server — no network, no keys
 docs/                the documentation above (also the mkdocs site and the wiki)
-examples/            demo reports and the fictional fingerprint config
+examples/            demo throughput report
 targets.*.toml       ready-made configs: mock demo, curated, full, gateway, example
 scripts/             wiki publisher, README asset renderer
 ```
@@ -187,9 +168,8 @@ python scripts/render_assets.py        # re-render README images from real CLI o
 ## Limits
 
 - Chat-completions SSE only — no Responses API, embeddings, images, audio.
-- `fingerprint` can fail to disprove identical weights; it cannot prove them.
 - Numbers are from *your* network position: latency includes your RTT.
-- Speed, weights and quality are three questions; `tps` answers the first two.
+- Speed and quality are separate questions; `tps` answers speed, not quality.
 
 ## License
 

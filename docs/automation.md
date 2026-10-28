@@ -33,9 +33,6 @@ tps discover deepseek/deepseek-v4.1-flash --json \
   | jq '.endpoints | sort_by(.price_out_per_1m) | .[:5]
         | .[] | {provider, quantization, price_out_per_1m}'
 
-# did the fingerprint split the field?
-tps fingerprint -c targets.toml --json | jq -r '.verdict, (.clusters | tostring)'
-
 # where did the 429s happen?
 tps run -c targets.toml --json --concurrency 1,16 \
   | jq '.results[] | {target, c16: .by_concurrency["16"] | {ok, n, errors}}'
@@ -81,8 +78,6 @@ version:
    invent a key.
 2. `tps discover <model> --json` → choose targets by policy (price, quant).
 3. `tps run --json` → read `results[]`, never scrape the table.
-4. `tps fingerprint --json` → refuse to present a cheap row as equivalent when
-   `verdict` is `split`; treat `no_data` targets as unverified, not different.
 
 Rules an agent must respect: no retries, no `--mock` numbers in a report, no
 conclusions below ~7 reps, and always include the date and your region.
@@ -95,7 +90,6 @@ Requests = `targets × prompts × reps × Σ(concurrency)`.
 |---|---|---|---|
 | 11 targets, 1 prompt, 7 reps, c=1,4 | 385 | ~20 min | ~120k |
 | 41 targets, 2 prompts, 7 reps, c=1 | 574 | ~45 min | ~180k |
-| fingerprint, 11 targets, 2 prompts | 44 | ~1 min | ~8k |
 
 Start with `--reps 3 --concurrency 1` to catch config errors, then scale up.
 

@@ -154,23 +154,6 @@ the same tables `run` prints. `--markdown` prints `report.md` instead. A missing
 Use it to analyse a run again after changing `tps`, to recover a deleted report,
 or to render an interrupted run.
 
-## `tps fingerprint`
-
-```bash
-tps fingerprint [-c FILE] [-o DIR] [--reps 2] [--prompt-count 2] [--max-tokens 160]
-                [--timeout S] [--mock]
-```
-
-Sends the same prompt `--reps` times per target at temperature 0 (unless the
-config says `temperature = "omit"`), non-streaming, with `logprobs` and 20
-`top_logprobs` (5 where a provider caps it), and compares token sequences. On
-OpenRouter targets reasoning is turned off (`reasoning = {enabled = false}`;
-`extra_body.reasoning` overrides). Writes `fingerprints.jsonl` — each row keeps
-the full `top_logprobs` per position and any `reasoning_tokens` — and
-`fingerprint.md`. Exits 4 if no request succeeded. `fingerprints.jsonl` is
-written as requests finish; Ctrl-C keeps them and writes a `PARTIAL` report.
-See [fingerprinting](fingerprinting.md).
-
 ---
 
 ## JSON output
@@ -286,31 +269,6 @@ Latency and rate fields describe the lowest concurrency (`concurrency`);
    "reported_p50_throughput":null,"reported_p50_latency_s":null}],
  "config":"targets.toml","targets":41}
 ```
-
-### `fingerprint`
-
-```json
-{"schema_version":1,"command":"fingerprint","ok":true,"mock":false,
- "verdict":"split",
- "clusters":[["deepinfra","together"],["decart"]],
- "no_data":{"nebius":"http_401: ..."},
- "noisy":[],
- "unmeasured":[],
- "distinguishable_groups":2,
- "noise_floor_measured":true,
- "self_agreement":{"deepinfra":1.0,"together":0.99,"decart":1.0},
- "self_first_divergence":{"deepinfra":null,"together":142,"decart":null},
- "pairs":[{"a":"deepinfra","b":"together","agreement":0.997,"first_divergence":142}],
- "prompt_tokens":{"deepinfra":171,"together":171,"decart":171,"nebius":null},
- "prompt_used":"prose-256"}
-```
-
-`verdict` is `split` (two or more distinguishable groups among deterministic
-targets), `consistent`, or `inconclusive` (fewer than two targets with a
-measured, deterministic noise floor — always the case with `--reps 1`). Targets
-that errored are in `no_data` and never in `clusters`; `noisy` and `unmeasured`
-targets are clustered but never decide the verdict — each joins the one group
-it matches, and never merges two.
 
 ### `doctor`
 

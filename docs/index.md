@@ -19,7 +19,6 @@
 | [Metrics](metrics.md) | you want the exact definition behind TTFT, ITL, tok/s, cost |
 | [Methodology](methodology.md) | you are about to publish a comparison and want it to survive review |
 | [Gateways](gateways.md) | comparing a gateway against direct, or gateway against gateway |
-| [Fingerprinting](fingerprinting.md) | a price looks too good, or two "identical" endpoints differ 3× in speed |
 
 ## Operations
 
@@ -39,8 +38,7 @@ JSON schema, invariants. [llms.txt](https://github.com/teal-sea/tpsbench/blob/ma
 Pick a model, enumerate its providers, pin one upstream per target, send identical
 prompts at temperature 0 with streaming enabled, and measure TTFT, inter-token
 latency, decode rate, aggregate throughput, failures and cost — interleaved so
-time-of-day doesn't leak into one row. Then test whether the "same model" is
-actually the same weights. Everything else in these docs is detail about not
+time-of-day doesn't leak into one row. Everything else in these docs is detail about not
 fooling yourself.
 
 ## Where these docs live

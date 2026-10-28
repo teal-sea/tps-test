@@ -70,24 +70,6 @@ Re-render any time with `tps report runs/<stamp>`.
 
 Pass the directory printed by `tps run` (contains `raw.jsonl`), not its parent.
 
-## Fingerprint says everything is one group
-
-That is a real result: at 160 tokens the endpoints were indistinguishable. It does
-not prove identical weights. Increase `--max-tokens` and `--prompt-count` to probe
-harder, or accept that speed differences come from serving, not weights.
-
-## Fingerprint says a provider is non-deterministic
-
-`self_agreement` < 98% at temperature 0. That endpoint varies run to run — often
-batch-dependent kernels or a router fanning out between backends. Its
-cross-provider numbers are not interpretable, so it never decides the verdict;
-exclude it or investigate.
-
-## Fingerprint lists a provider under "no data"
-
-Its request failed (auth, 5xx, timeout — the reason is printed). That is not
-evidence of different weights; fix the error and re-run.
-
 ## Import error: `No module named tps`
 
 You are running `python -m tps` outside the repo, or the package is not installed.
@@ -111,8 +93,7 @@ unique `name`.
 
 ## `only defines mock targets — add --mock` (exit 1)
 
-`targets.mock.toml` and `examples/fingerprint-demo.toml` are synthetic demos; run
-them with `--mock`.
+`targets.mock.toml` is a synthetic demo; run it with `--mock`.
 
 ## Still stuck
 

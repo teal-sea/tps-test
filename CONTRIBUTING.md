@@ -40,15 +40,12 @@ needs a very good reason and a docs update:
    [docs/cli.md](docs/cli.md#exit-codes).
 4. Token counts come from `usage`; estimates are always flagged.
 5. Mock data is always flagged and never mixes into a real run.
-6. A failed request is never evidence that a provider serves different weights.
-7. Demo data and screenshots use fictional providers only.
+6. Demo data and screenshots use fictional providers only.
 
 [AGENTS.md](AGENTS.md) has the same rules in a denser form.
 
 ## Reporting results about real providers
 
-Please don't open issues or PRs that accuse a named provider of serving the
-wrong model based on one fingerprint run. The tool can fail to disprove
-identical weights; it cannot prove a difference is intentional. Share the
-`fingerprint.md`, the config and the date, and say what you'd like to change in
-the tool.
+Please don't open issues or PRs that accuse a named provider of misbehaving
+based on one run. Speed varies by hour, region and load. Share the `report.md`,
+the config and the date, and say what you'd like to change in the tool.

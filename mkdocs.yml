@@ -62,7 +62,6 @@ nav:
       - Metrics: metrics.md
       - Methodology: methodology.md
       - Gateways: gateways.md
-      - Fingerprinting: fingerprinting.md
   - Operations:
       - Automation: automation.md
       - Troubleshooting: troubleshooting.md

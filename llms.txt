@@ -1,7 +1,7 @@
 # tpsbench
 
 > Measure one model across many providers and gateways: TTFT, inter-token
-> latency, throughput, cost, and whether they serve the same weights.
+> latency, throughput, and cost.
 
 CLI: `tps` (Python 3.11+, single dependency: httpx).
 
@@ -15,7 +15,6 @@ CLI: `tps` (Python 3.11+, single dependency: httpx).
 - [docs/metrics.md](docs/metrics.md): definition of every metric
 - [docs/methodology.md](docs/methodology.md): how not to produce a misleading comparison
 - [docs/gateways.md](docs/gateways.md): measuring the gateway itself
-- [docs/fingerprinting.md](docs/fingerprinting.md): same weights or same name
 - [docs/automation.md](docs/automation.md): CI, cron, JSON pipelines
 - [docs/troubleshooting.md](docs/troubleshooting.md)
 - [docs/faq.md](docs/faq.md)
@@ -31,4 +30,3 @@ CLI: `tps` (Python 3.11+, single dependency: httpx).
 - `--mock` produces synthetic numbers and is flagged in the output; mock profiles are ignored without it.
 - p90 is always the slow tail (for tok/s, the 10th percentile).
 - `results[].ok/n` count every concurrency level; `by_concurrency` breaks them down.
-- `fingerprint --json` has a `verdict`; failed targets go to `no_data`, never to a cluster.

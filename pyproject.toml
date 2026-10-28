@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tpsbench"
 version = "0.1.0"
-description = "Measure one model across many providers and gateways: TTFT, inter-token latency, throughput, cost, and whether they serve the same weights."
+description = "Measure one model across many providers and gateways: TTFT, inter-token latency, throughput, and cost."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
