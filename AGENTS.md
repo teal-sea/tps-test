@@ -26,9 +26,8 @@ library API — drive it as a subprocess and parse `--json`.
 7. **Mock data never leaks.** `mock = {…}` profiles apply only under `--mock`;
    every mock output is flagged (`"mock": true`, `MOCK DATA`). README images come
    from `scripts/render_assets.py` with fictional providers only.
-8. **A failed request is not evidence.** Fingerprint targets with no data are
-   reported in `no_data`, never clustered as "different weights"; targets
-   without a measured, deterministic noise floor never decide the verdict.
+8. **A failed request is not evidence.** Failures are counted and reported
+   (`ok/n`, `errors`), never silently dropped or timed as an answer.
 
 ## Commands
 
@@ -41,7 +40,6 @@ tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b
                 [--max-tokens N] [--temperature T] [--timeout S] [--dry-run] [--mock]
 tps run         --base-url URL --model ID [--api-key-env VAR] [--price IN,OUT] [...]
 tps report      RUN_DIR [--markdown]
-tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--timeout S] [--mock]
 ```
 
 `--base-url` measures one OpenAI-compatible endpoint with no config file (not
@@ -141,13 +139,6 @@ undercounts CJK/code); `null` when no target has a price. `est_minutes` assumes
 the stated rate.
 
 `discover` adds `model`, `endpoints[]`, `config`, `targets`.
-`fingerprint` adds `verdict` (`split`|`consistent`|`inconclusive`), `clusters[][]`,
-`no_data{target: error}`, `noisy[]`, `unmeasured[]`, `distinguishable_groups`,
-`noise_floor_measured`, `self_agreement{}`,
-`pairs[]`, `prompt_tokens{}`, `reasoning_seen[]`. It requests 20
-`top_logprobs` (5 if capped; all kept in `fingerprints.jsonl`) and turns
-reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
-`no_data` with `reasoning_consumed_budget`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`.
 
 Treat `results[].ok/n` as the reliability signal — they count every concurrency
@@ -170,18 +161,13 @@ tps run --base-url https://api.example.com/v1 --model <id> --api-key-env VAR --j
   | jq '.results[] | {ttft_p50_s, out_tps_p50, itl_p50_ms, reasoning_only, notes}'
 ```
 
-**"Is the cheap one the same model?"**
-```bash
-tps fingerprint -c /tmp/t.toml --json | jq '.verdict, .clusters, .no_data'
-```
-
 ## Cost and time
 
 Don't estimate by hand: `tps run … --dry-run --json` returns the request count,
 worst-case cost and rough minutes for exactly the flags you pass. For scale: 11
 targets, 1 prompt, 7 reps, concurrency 1 and 4 = 385 measured + 22 warm-up
-requests ≈ 20 min, ≤ $0.10 worst case (≈ $0.05 in practice). `fingerprint` ≈ 44
-requests ≈ 1 min. Always dry-run a 41-target config first.
+requests ≈ 20 min, ≤ $0.10 worst case (≈ $0.05 in practice). Always dry-run a
+41-target config first.
 
 ## Failure modes you will hit
 

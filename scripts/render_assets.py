@@ -487,7 +487,7 @@ def banner(width: int = 1280, height: int = 400, social: bool = False) -> str:
     )
     sub = text(
         MONO,
-        "ttft · itl · tok/s · load · cost · same-weights check",
+        "ttft · itl · tok/s · load · cost",
         17 if not social else 21,
         left,
         tag_y + (38 if not social else 46),
@@ -603,19 +603,6 @@ def build() -> dict[str, str]:
         "tps run  ·  demo data (--mock)",
         cols,
     )
-    # fictional providers only: a screenshot must never show a real provider
-    # "serving different weights" on synthetic data
-    (work / "fingerprint-demo.toml").write_text(
-        (ROOT / "examples" / "fingerprint-demo.toml").read_text()
-    )
-    fp = capture(
-        ["fingerprint", "-c", "fingerprint-demo.toml", "--mock", "-o", "runs/fp"], work, cols
-    )
-    files["screenshot-fingerprint.svg"] = terminal_svg(
-        prompt_line("tps fingerprint -c examples/fingerprint-demo.toml --mock") + fp,
-        "tps fingerprint  ·  demo data (--mock)",
-        cols,
-    )
     doctor = capture(["doctor", "-c", "targets.mock.toml"], work, cols)
     files["screenshot-doctor.svg"] = terminal_svg(
         prompt_line("tps doctor -c targets.mock.toml") + doctor, "tps doctor", cols
@@ -628,9 +615,6 @@ def build() -> dict[str, str]:
         report,
     )
     files["../../examples/demo-throughput-report.md"] = report
-    files["../../examples/demo-fingerprint-report.md"] = (
-        work / "runs" / "fp" / "fingerprint.md"
-    ).read_text(encoding="utf-8")
     files["banner.svg"] = banner()
     files["social-preview.svg"] = banner(1280, 640, social=True)
     files["logo.svg"] = logo()

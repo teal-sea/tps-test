@@ -70,8 +70,6 @@ ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
   keeps those tokens out of tok/s, and notes that TTFT includes them. At the
   built-in prompts' 256-token cap Claude Opus 5.5 usually spends the whole cap
   thinking — `--max-tokens 2048`.
-- **Fingerprinting** compares whole texts: there are no logprobs and no greedy
-  decoding, so Claude normally shows up as `noisy` and can't decide a verdict.
 
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target
@@ -177,5 +175,4 @@ run without `--mock`.
 ```toml
 mock = { ttft = [0.21, 0.34], itl = [0.007, 0.011], scaling = 0.45 }
 #        TTFT range (s)       chunk-gap range (s)   <1: degrades under load
-mock = { family = 1, noisy = true }   # fingerprint demo: weight family 0–2, self-disagreement
 ```

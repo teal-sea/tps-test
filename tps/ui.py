@@ -38,9 +38,6 @@ BADGES = {
     "muted": "\033[1;30;47m",  # bold black on grey
 }
 
-# one colour per fingerprint cluster, cycled
-GROUP_COLOURS = [BRIGHT_CYAN, MAGENTA, YELLOW, BRIGHT_GREEN, BLUE, RED]
-
 EIGHTHS = " ▏▎▍▌▋▊▉"
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -167,10 +164,6 @@ class UI:
         if not self.color or self.json_mode:
             return f"[{text}]"
         return self.style(f" {text} ", BADGES[tone])
-
-    def group(self, index: int) -> Callable[[str], str]:
-        colour = GROUP_COLOURS[index % len(GROUP_COLOURS)]
-        return lambda text: self.style(text, BOLD, colour)
 
     # -- lines -----------------------------------------------------------
     def say(self, text: str = "") -> None:

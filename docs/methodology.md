@@ -57,12 +57,6 @@ have not measured a difference yet — run more reps before writing a conclusion
 A provider that stops early looks fast. Compare the `out tok` column before
 comparing tok/s.
 
-## 10. The model name is not the artifact
-
-Different quantization, a distilled sibling, an older revision, or a different
-model entirely can sit behind the same slug. `tps fingerprint` tests it; the
-[cheap-price smell test](fingerprinting.md) explains how to read the result.
-
 ---
 
 ## What "fair" looks like, concretely
@@ -92,4 +86,4 @@ A run that should not be trusted:
 - No retries: tail behaviour is measured, not smoothed.
 - Chat-completions SSE only.
 - Provider-reported stats in `discover` are *their* numbers, not yours.
-- `fingerprint` can fail to disprove identical weights; it cannot prove them.
+- The tool measures speed, not quality or what weights sit behind a model name.

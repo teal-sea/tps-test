@@ -1,7 +1,7 @@
 # FAQ
 
 **Is this a benchmark of model quality?**
-No. Speed, cost, and weights-identity. Quality needs your own eval.
+No. Speed and cost. Quality needs your own eval.
 
 **Why so many reps?**
 Provider throughput swings 2–3× with load. Fewer than ~7 samples and you are
@@ -28,10 +28,6 @@ network.
 **Does the gateway add latency?**
 Sometimes nothing, sometimes hundreds of ms. Measure it: `docs/gateways.md`. Watch
 ITL too — a buffering proxy can keep TTFT fine while destroying smoothness.
-
-**Are the cheap endpoints the same model?**
-Often not. `tps fingerprint` clusters them by token-level agreement. It can fail to
-disprove identity; it cannot prove it.
 
 **Can I use it for embeddings / images / audio?**
 No — chat-completions SSE only.

@@ -4,6 +4,16 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- `tps fingerprint` and everything that existed only for it: the greedy-decode
+  engine, `fingerprint.md` / `fingerprints.jsonl`, its mock weight families
+  (`mock = { family, noisy }`), the `fingerprinting` doc, demo config, example
+  report and screenshot. There is no deprecation shim; `tps fingerprint` is now
+  an unknown command (exit 1). Entries below are history.
+
 ## [0.1.0] — unreleased
 
 First public release.

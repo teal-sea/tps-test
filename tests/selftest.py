@@ -16,6 +16,7 @@ import asyncio
 import csv
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -104,10 +105,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-
-        if body.get("stream") is False:
-            self._non_streaming(body)
-            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -251,12 +248,6 @@ class Handler(BaseHTTPRequestHandler):
         stop = "end_turn" if answers else "max_tokens"
         if model == "claude-refusal":
             stop = "refusal"
-        text = " ".join(f"tok{i}" for i in range(TOKENS))
-        if not body.get("stream"):
-            content = [{"type": "thinking", "thinking": ""}]
-            content += [{"type": "text", "text": text}] if answers else []
-            self._json(200, {"content": content, "stop_reason": stop, "usage": usage})
-            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -286,77 +277,6 @@ class Handler(BaseHTTPRequestHandler):
     def _done(self) -> None:
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
-
-    def _non_streaming(self, body: dict) -> None:
-        """Deterministic greedy completion, for the fingerprint tests.
-
-        `test-model` and `other-model` agree for 40 tokens then diverge, which
-        mimics 'same base, different quantization' well enough to assert on.
-        """
-        model = body.get("model", "")
-        if model == "fp-fail":
-            self._json(500, {"error": {"message": "upstream down"}})
-            return
-        if model == "fp-slow":
-            time.sleep(0.4)
-        if model == "text-only-model" and body.get("logprobs"):
-            self._json(
-                400,
-                {"error": {"message": "logprobs are not supported for this model", "code": 400}},
-            )
-            return
-        if model == "capped-logprobs" and (body.get("top_logprobs") or 0) > 5:
-            self._json(400, {"error": {"message": "top_logprobs must be between 0 and 5"}})
-            return
-        if model == "reasoner-empty":  # thought through the whole cap, answered nothing
-            message = {"role": "assistant", "content": "", "reasoning": "let me think" * 20}
-            self._json(
-                200,
-                {
-                    "choices": [{"message": message, "finish_reason": "length"}],
-                    "usage": {
-                        "prompt_tokens": 78,
-                        "completion_tokens": 160,
-                        "completion_tokens_details": {"reasoning_tokens": 160},
-                    },
-                },
-            )
-            return
-
-        tokens = [f"t{i}" for i in range(120)]
-        if model == "other-model":
-            tokens = tokens[:40] + [f"x{i}" for i in range(80)]
-        content = " ".join(tokens)
-        choice: dict = {
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "length",
-        }
-        if body.get("logprobs"):
-            k = min(int(body.get("top_logprobs") or 0), 3)
-            choice["logprobs"] = {
-                "content": [
-                    {
-                        "token": t,
-                        "logprob": -0.01,
-                        "top_logprobs": [
-                            {"token": t, "logprob": -0.01},
-                            *({"token": f"alt{j}", "logprob": -5.0 - j} for j in range(k - 1)),
-                        ],
-                    }
-                    for t in tokens
-                ]
-            }
-        self._json(
-            200,
-            {
-                "choices": [choice],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": len(tokens),
-                    "total_tokens": 11 + len(tokens),
-                },
-            },
-        )
 
 
 class Server(ThreadingHTTPServer):
@@ -761,218 +681,6 @@ async def main() -> int:
             "p90 tok/s is the slow tail", core.p90([10, 20, 30, 40, 50], higher_is_better=True) < 20
         )
 
-        print("fingerprint (same weights vs different artifact):")
-        fp_cfg = core.RunConfig(
-            targets=[], prompts={"prose-256": dict(core.DEFAULT_PROMPTS["prose-256"])}
-        )
-        alpha = tgt("test-model", name="alpha", api_key="k")
-        beta = tgt("other-model", name="beta", api_key="k")
-        gamma = tgt("text-only-model", name="gamma", api_key="k")
-        down = tgt("fp-fail", name="down", api_key="k")
-        async with httpx.AsyncClient(http2=False, timeout=30.0) as fp_client:
-            prints = []
-            for t in (alpha, alpha, beta, beta, gamma, gamma):
-                prints.append(
-                    await core.fingerprint_once(fp_client, t, "probe", "prose-256", 120, fp_cfg, 0)
-                )
-            failed_prints = [
-                await core.fingerprint_once(fp_client, down, "probe", "prose-256", 120, fp_cfg, rep)
-                for rep in (0, 1)
-            ]
-        a0, a1, b0, b1, g0, g1 = prints
-        check("streamed tokens parsed", a0.ok and a0.tokens[:3] == ["t0", "t1", "t2"])
-        check("self-agreement is exact", a0.tokens == a1.tokens)
-        frac_cross, first_cross = core.token_agreement(a0.tokens, b0.tokens, "tokens", "tokens")
-        check("cross agreement 40/120", abs(frac_cross - 40 / 120) < 1e-9, str(frac_cross))
-        check("first divergence at 40", first_cross == 40, str(first_cross))
-        frac_short, first_short = core.token_agreement(
-            a0.tokens[:10], a0.tokens, "tokens", "tokens"
-        )
-        check(
-            "early stop is not a perfect match",
-            frac_short < 0.1 and first_short == 10,
-            f"{frac_short} {first_short}",
-        )
-        check(
-            "logprobs-unsupported falls back to text mode",
-            g0.ok and g0.mode == "text",
-            f"{g0.mode} {g0.error}",
-        )
-        check("text mode self-agreement", core.compare_prints(g0, g1)[0] == 1.0)
-
-        fp_report = core.fingerprint_reports(prints, ["alpha", "beta", "gamma"], ["prose-256"])
-        check("two weight clusters", fp_report.count("**group") == 2, fp_report[:200])
-        check(
-            "alpha+gamma cluster together",
-            "alpha, gamma" in fp_report or "gamma, alpha" in fp_report,
-        )
-        check("no reps -> noise floor reported as not measured", "Not measured" in fp_report)
-
-        # a target that errored is absence of evidence, never "different weights"
-        same = [
-            core.Fingerprint("a", "p", rep, True, tokens=a0.tokens, text=a0.text, prompt_tokens=11)
-            for rep in (0, 1)
-        ] + [
-            core.Fingerprint("b", "p", rep, True, tokens=a0.tokens, text=a0.text, prompt_tokens=11)
-            for rep in (0, 1)
-        ]
-        for f in failed_prints:
-            f.target, f.prompt = "down", "p"
-        summary = core.fingerprint_summary(same + failed_prints, ["a", "b", "down"], ["p"])
-        check(
-            "failed target not clustered",
-            summary["clusters"] == [["a", "b"]],
-            str(summary["clusters"]),
-        )
-        check(
-            "failed target listed as no data", "down" in summary["no_data"], str(summary["no_data"])
-        )
-        check(
-            "verdict consistent despite failure",
-            summary["verdict"] == "consistent",
-            summary["verdict"],
-        )
-        none = core.fingerprint_summary(failed_prints, ["down"], ["p"])
-        check("all failed -> inconclusive", none["verdict"] == "inconclusive", none["verdict"])
-        one_rep = core.fingerprint_summary(
-            [
-                core.Fingerprint("a", "p", 0, True, tokens=a0.tokens),
-                core.Fingerprint("b", "p", 0, True, tokens=b0.tokens),
-            ],
-            ["a", "b"],
-            ["p"],
-        )
-        check(
-            "no noise floor (--reps 1) -> inconclusive, never split",
-            one_rep["verdict"] == "inconclusive" and not one_rep["noise_floor_measured"],
-            one_rep["verdict"],
-        )
-        second_failed = same + [
-            core.Fingerprint("c", "p", 0, True, tokens=b0.tokens, text=b0.text),
-            core.Fingerprint("c", "p", 1, False, error="rate_limited: 429"),
-        ]
-        partial = core.fingerprint_summary(second_failed, ["a", "b", "c"], ["p"])
-        check(
-            "target without a floor is unmeasured and can't force a split",
-            partial["verdict"] == "consistent" and partial["unmeasured"] == ["c"],
-            f"{partial['verdict']} {partial['unmeasured']} {partial['clusters']}",
-        )
-        # x and y differ at 2 of 100 tokens (98%: split at a perfect floor); u
-        # is 99% from each, so in one union-find it would bridge them
-        ref = [f"t{i}" for i in range(100)]
-        x_toks, y_toks, u_toks = ref, list(ref), list(ref)
-        y_toks[10], y_toks[20], u_toks[10] = "y10", "y20", "y10"
-        firm = [
-            core.Fingerprint(name, "p", rep, True, tokens=toks)
-            for name, toks in (("x", x_toks), ("y", y_toks))
-            for rep in (0, 1)
-        ]
-        u0 = core.Fingerprint("u", "p", 0, True, tokens=u_toks)
-        bridged = {
-            "unmeasured": [u0, core.Fingerprint("u", "p", 1, False, error="rate_limited: 429")],
-            "noisy": [u0, core.Fingerprint("u", "p", 1, True, tokens=u_toks[:50] + ref[:50])],
-        }
-        for kind, u_prints in bridged.items():
-            bridge = core.fingerprint_summary(firm + u_prints, ["x", "y", "u"], ["p"])
-            check(
-                f"{kind} target can't bridge two groups into consistent",
-                bridge["verdict"] == "split"
-                and bridge["distinguishable_groups"] == 2
-                and bridge["clusters"] == [["x"], ["y"], ["u"]]
-                and bridge[kind] == ["u"],
-                f"{bridge['verdict']} {bridge['clusters']}",
-            )
-        joined = core.fingerprint_summary(
-            same + [core.Fingerprint("u", "p", 0, True, tokens=a0.tokens)],
-            ["a", "b", "u"],
-            ["p"],
-        )
-        check(
-            "unmeasured target joins the one group it matches",
-            joined["verdict"] == "consistent" and joined["clusters"] == [["a", "b", "u"]],
-            f"{joined['verdict']} {joined['clusters']}",
-        )
-
-        print("fingerprint v2 groundwork:")
-        omit_cfg = core.RunConfig(targets=[], prompts={}, temperature="omit")
-        async with httpx.AsyncClient(http2=False, timeout=30.0) as fp_client:
-            full = await core.fingerprint_once(
-                fp_client, alpha, "probe", "prose-256", 120, fp_cfg, 0
-            )
-            full_body = dict(BODIES["test-model"])
-            omitted = await core.fingerprint_once(
-                fp_client, tgt("test-model", name="o"), "probe", "prose-256", 120, omit_cfg, 0
-            )
-            omit_body = dict(BODIES["test-model"])
-            capped_lp = await core.fingerprint_once(
-                fp_client, tgt("capped-logprobs", name="c"), "probe", "prose-256", 120, fp_cfg, 0
-            )
-            capped_body = dict(BODIES["capped-logprobs"])
-            spent = await core.fingerprint_once(
-                fp_client, tgt("reasoner-empty", name="r"), "probe", "prose-256", 120, fp_cfg, 0
-            )
-        check(
-            "fingerprint asks for 20 top logprobs and stores the alternatives",
-            full_body.get("top_logprobs") == core.TOP_LOGPROBS
-            and full_body.get("temperature") == 0.0
-            and full.top_logprobs
-            and set(full.top_logprobs[0]) == {"t0", "alt0", "alt1"},
-            str(full.top_logprobs[:1]),
-        )
-        check(
-            'fingerprint honours temperature = "omit" (review #8)',
-            "temperature" not in omit_body and omitted.ok,
-            str(sorted(omit_body)),
-        )
-        check(
-            "a provider that caps top_logprobs at 5 gets 5, and stays in token mode",
-            capped_lp.ok and capped_lp.mode == "tokens" and capped_body.get("top_logprobs") == 5,
-            f"{capped_lp.mode} {capped_body.get('top_logprobs')} {capped_lp.error}",
-        )
-        check(
-            "reasoning that ate the budget is named, with the fix",
-            core.error_class(spent.__dict__) == "reasoning_consumed_budget"
-            and "--max-tokens" in (spent.error or "")
-            and spent.reasoning_tokens == 160,
-            str(spent.error),
-        )
-        spent_summary = core.fingerprint_summary([spent], ["r"], ["prose-256"])
-        spent_report = core.fingerprint_reports([spent], ["r"], ["prose-256"])
-        check(
-            "prompt_tokens signature survives a failed completion (v1 said 'none reported')",
-            spent_summary["prompt_tokens"] == {"r": 78}
-            and "No provider reported" not in spent_report
-            and spent_summary["reasoning_seen"] == ["r"],
-            str(spent_summary["prompt_tokens"]),
-        )
-
-        sent: list[dict] = []
-
-        def openrouter(request: httpx.Request) -> httpx.Response:
-            sent.append(json.loads(request.content))
-            return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
-
-        router = core.Target(
-            name="or", base_url="https://openrouter.ai/api/v1", model="m", api_key="k"
-        )
-        router_on = core.Target(
-            name="or-on",
-            base_url="https://openrouter.ai/api/v1",
-            model="m",
-            api_key="k",
-            extra_body={"reasoning": {"enabled": True}},
-        )
-        async with httpx.AsyncClient(transport=httpx.MockTransport(openrouter)) as mocked:
-            for t in (router, router_on, alpha):
-                await core.fingerprint_once(mocked, t, "probe", "prose-256", 120, fp_cfg, 0)
-        check(
-            "fingerprint turns reasoning off on OpenRouter; extra_body can turn it back on",
-            sent[0].get("reasoning") == {"enabled": False}
-            and sent[1].get("reasoning") == {"enabled": True}
-            and "reasoning" not in sent[2],
-            str([s.get("reasoning") for s in sent]),
-        )
-
         print("discover (offline fixture):")
         fixture = ROOT / "tests" / "fixtures" / "openrouter-endpoints.sample.json"
         out = run_dir / "targets.toml"
@@ -1371,34 +1079,6 @@ async def main() -> int:
             core.max_prompt_tokens(cjk) >= len(cjk) > 3 * core.estimate_tokens(cjk),
             f"{core.max_prompt_tokens(cjk)} vs {len(cjk)} chars, est {core.estimate_tokens(cjk)}",
         )
-        (work / "fp_claude.toml").write_text(
-            '[run]\nprompts = ["prose-256"]\n\n'
-            + "".join(
-                target_block(
-                    name, base, model, 'api = "anthropic"\napi_key_env = "TPS_SELFTEST_CLAUDE_KEY"'
-                )
-                for name, model in (
-                    ("opus", "claude-sim"),
-                    ("sonnet", "claude-sim"),
-                    ("tight", "claude-capped"),
-                )
-            ),
-            encoding="utf-8",
-        )
-        fp_claude = tps(
-            ["fingerprint", "-c", "fp_claude.toml", "-o", "fpc", "--prompt-count", "1", "--json"],
-            work,
-            env_extra=claude_env,
-        )
-        fpc = json.loads(fp_claude.stdout or "{}")
-        check(
-            "fingerprint on the Claude API: text mode; thinking that ate the cap is no_data",
-            fpc.get("verdict") == "consistent"
-            and fpc.get("no_data", {}).get("tight", "").startswith("reasoning_consumed_budget")
-            and fpc.get("self_agreement", {}).get("opus") == 1.0,
-            fp_claude.stdout[:300] or fp_claude.stderr[-300:],
-        )
-
         print("dry run:")
         (work / "plan.toml").write_text(
             '[run]\nreps = 3\nconcurrency = [1, 4]\nwarmup = 1\nprompts = ["prose-256"]\n\n'
@@ -1763,33 +1443,34 @@ async def main() -> int:
         check(
             "doctor: missing key exits 2", doctor_keys.returncode == 2, str(doctor_keys.returncode)
         )
+        print("removed commands:")
+        helped = tps(["--help"], work)
+        listed = re.findall(r"^    (\w+)  ", helped.stdout, re.M)
+        check(
+            "help lists exactly the remaining commands",
+            helped.returncode == 0
+            and listed == ["doctor", "init", "discover", "run", "report"]
+            and "fingerprint" not in helped.stdout,
+            helped.stdout[:300],
+        )
+        seen_before = len(SEEN)
+        gone = tps(["fingerprint", "-c", "local.toml", "--json"], work)
+        gone_payload = json.loads(gone.stdout or "null")  # the whole of stdout is one object
+        check(
+            "fingerprint is not a command: exit 1, one JSON error object, no request sent",
+            gone.returncode == 1
+            and isinstance(gone_payload, dict)
+            and gone_payload.get("ok") is False
+            and gone_payload.get("error", {}).get("code") == 1
+            and len(SEEN) == seen_before,
+            gone.stdout[:300],
+        )
+
         doctor_local = tps(["doctor", "-c", "local.toml"], work)
         check(
             "doctor: 127.0.0.1 needs no key",
             doctor_local.returncode == 0,
             doctor_local.stdout[-300:],
-        )
-
-        (work / "fp.toml").write_text(
-            '[run]\nprompts = ["prose-256"]\n\n'
-            + target_block("alpha", base, "test-model")
-            + target_block("beta", base, "test-model")
-            + target_block("down", base, "fp-fail"),
-            encoding="utf-8",
-        )
-        fp = tps(["fingerprint", "-c", "fp.toml", "-o", "fp", "--json"], work)
-        fp_payload = json.loads(fp.stdout or "{}")
-        check(
-            "fingerprint: failed target is no_data, verdict consistent",
-            fp_payload.get("verdict") == "consistent" and "down" in fp_payload.get("no_data", {}),
-            fp.stdout[:300],
-        )
-        (work / "fp_down.toml").write_text(target_block("down", base, "fp-fail"), encoding="utf-8")
-        fp_down = tps(["fingerprint", "-c", "fp_down.toml", "-o", "fpd", "--json"], work)
-        check(
-            "fingerprint: every request failed exits 4",
-            fp_down.returncode == 4,
-            str(fp_down.returncode),
         )
 
         print("interrupt keeps partial data:")
@@ -1828,51 +1509,6 @@ async def main() -> int:
             "partial report written and flagged",
             partial_report.exists() and "PARTIAL" in partial_report.read_text(),
         )
-        (work / "fp_slow.toml").write_text(
-            '[run]\nprompts = ["prose-256"]\n\n' + target_block("slow", base, "fp-slow"),
-            encoding="utf-8",
-        )
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "tps",
-                "fingerprint",
-                "-c",
-                "fp_slow.toml",
-                "-o",
-                "fpartial",
-                "--reps",
-                "30",
-            ],
-            cwd=work,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        fp_path = work / "fpartial" / "fingerprints.jsonl"
-        deadline = time.time() + 30
-        while time.time() < deadline and (not fp_path.exists() or fp_path.stat().st_size == 0):
-            time.sleep(0.1)
-        time.sleep(0.5)
-        proc.send_signal(signal.SIGINT)
-        proc.communicate(timeout=30)
-        kept_fp = (
-            [line for line in fp_path.read_text().splitlines() if line.strip()]
-            if fp_path.exists()
-            else []
-        )
-        fp_md = work / "fpartial" / "fingerprint.md"
-        check(
-            "fingerprint ctrl-c: exits 130, keeps data, partial report",
-            proc.returncode == 130
-            and len(kept_fp) >= 1
-            and fp_md.exists()
-            and "PARTIAL" in fp_md.read_text(),
-            f"{proc.returncode} {len(kept_fp)}",
-        )
-
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(
             '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'

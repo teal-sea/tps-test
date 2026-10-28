@@ -491,121 +491,6 @@ def _wrap(text: str, width: int) -> list[str]:
     return textwrap.wrap(text, max(30, width), break_on_hyphens=False) or [""]
 
 
-def print_fingerprint(
-    ui: UI, summary: dict[str, Any], prints: list[core.Fingerprint], targets: list[str]
-) -> None:
-    if ui.silent:
-        return
-    by_key = {(f.target, f.prompt, f.rep): f for f in prints}
-    prompt = summary["prompt_used"]
-    present = [t for t in targets if t not in summary["no_data"]]
-    group_of = {t: i for i, g in enumerate(summary["clusters"]) for t in g}
-
-    if 2 <= len(present) <= 12:
-        letters = "ABCDEFGHIJKL"
-        name_w = min(26, max(len(t) for t in present))
-        label_w = name_w + 4
-        grid = label_w + 5 * len(present) + 1
-        title = f" agreement · {prompt} · % identical tokens "
-        plain = "■ ≥99  ■ 90–99  ■ 50–90  ■ <50  ■ self"
-        # a two-target grid is narrower than its own title and legend
-        width = max(grid, len(title) + 1, len(plain) + 2)
-        ui.say()
-        ui.say(ui.grey("╭─") + ui.bold(title) + ui.grey("─" * max(0, width - len(title) - 1) + "╮"))
-        head = " " * label_w + "".join(f"{letters[i]:>4} " for i in range(len(present)))
-        ui.say(ui.grey("│") + ui.dim(head.ljust(width)) + ui.grey("│"))
-        for i, a_name in enumerate(present):
-            label = f" {letters[i]}  {a_name[:name_w]:<{name_w}}"
-            cells = []
-            for b_name in present:
-                if a_name == b_name:
-                    cells.append(ui.heat(summary["self_agreement"].get(a_name), diagonal=True))
-                    continue
-                frac, _ = core.compare_prints(
-                    by_key[(a_name, prompt, 0)], by_key[(b_name, prompt, 0)]
-                )
-                cells.append(ui.heat(frac))
-            colour = ui.group(group_of.get(a_name, 0))
-            pad = " " * (1 + width - grid)
-            ui.say(ui.grey("│") + colour(label) + "".join(cells) + pad + ui.grey("│"))
-        swatch = lambda code, text: ui.style("■", code) + " " + ui.grey(text)  # noqa: E731
-        legend = "  ".join(
-            [
-                swatch("\033[38;5;28m", "≥99"),
-                swatch("\033[38;5;178m", "90–99"),
-                swatch("\033[38;5;130m", "50–90"),
-                swatch("\033[38;5;88m", "<50"),
-                swatch("\033[38;5;238m", "self"),
-            ]
-        )
-        ui.say(ui.grey("├" + "─" * width + "┤"))
-        ui.say(ui.grey("│") + " " + legend + " " * max(0, width - len(plain) - 1) + ui.grey("│"))
-        ui.say(ui.grey("╰" + "─" * width + "╯"))
-
-    ui.say()
-    tokens = {}
-    for target, count in summary["prompt_tokens"].items():
-        if count is not None:  # the input's count, valid even if the reply failed
-            tokens.setdefault(count, []).append(target)
-    if len(tokens) > 1:
-        ui.warn(f"tokenizer: {len(tokens)} different prompt-token counts for the same input")
-        for count, names in sorted(tokens.items()):
-            for i, line in enumerate(_wrap(", ".join(names), ui.width - 20)):
-                ui.say(f"      {ui.grey(f'{count:>5} tok' if i == 0 else ' ' * 9)}  {line}")
-
-    noisy = set(summary["noisy"])
-    unweighed = noisy | set(summary["unmeasured"])
-    digits = len(str(max((len(g) for g in summary["clusters"]), default=1)))
-    for index, group in enumerate(summary["clusters"]):
-        colour = ui.group(index)
-        tag = (
-            " (no deterministic noise floor — can't be placed)"
-            if all(t in unweighed for t in group)
-            else ""
-        )
-        lines = _wrap(", ".join(group) + tag, ui.width - 22)
-        label = f"group {index + 1}"
-        count = ui.grey(f"({len(group):>{digits}})")
-        ui.say(f"  {colour('●')} {ui.bold(label)}  {count}  {lines[0]}")
-        for line in lines[1:]:
-            ui.say(" " * (17 + digits) + line)
-    for target, error in summary["no_data"].items():
-        ui.say(
-            f"  {ui.grey('○')} {ui.grey('no data')}  {target} {ui.grey('— ' + error.split(':')[0])}"
-        )
-    for target in summary["noisy"]:
-        value = summary["self_agreement"].get(target, 0)
-        ui.say(
-            f"  {ui.yellow('~')} {ui.grey('noisy')}    {target} {ui.grey(f'— self-agreement {value * 100:.0f}%')}"
-        )
-    if summary["noise_floor_measured"]:
-        for target in summary["unmeasured"]:
-            ui.say(
-                f"  {ui.yellow('?')} {ui.grey('no floor')} {target} {ui.grey('— second rep failed; not weighed')}"
-            )
-    else:
-        ui.warn("noise floor not measured — needs two successful reps per provider (--reps 2)")
-
-    ui.say()
-    verdict = summary["verdict"]
-    if verdict == "split":
-        firm = summary["distinguishable_groups"]
-        ui.say(
-            f"  {ui.badge('SPLIT', 'warn')} {firm} distinguishable groups — not the same artifact."
-        )
-        ui.hint("          Run a task eval before treating them as equivalent.")
-    elif verdict == "consistent":
-        ui.say(
-            f"  {ui.badge('CONSISTENT', 'ok')} indistinguishable at this resolution — "
-            "consistent with the same weights."
-        )
-    else:
-        ui.say(
-            f"  {ui.badge('INCONCLUSIVE', 'muted')} fewer than two providers with a measured, "
-            "deterministic noise floor."
-        )
-
-
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -990,10 +875,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     if failed:
         ui.warn(f"{failed}/{len(measured)} requests failed — see Failures in the report")
     ui.ok(f"wrote {ui.bold(f'{outdir}/report.md')}  {ui.grey('· summary.csv · raw.jsonl')}")
-    ui.hint(
-        f"  next → tps report {outdir}   ·   tps fingerprint -c {path}"
-        + (" --mock" if args.mock else "")
-    )
+    ui.hint(f"  next → tps report {outdir}")
 
     return {
         "command": "run",
@@ -1043,72 +925,6 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     return {"command": "report", "ok": True, "run_dir": str(args.run_dir), "report": text}
 
 
-def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
-    path = resolve_config(args.config)
-    cfg = core.load_config(path)
-    for flag, value in (
-        ("--reps", args.reps),
-        ("--prompt-count", args.prompt_count),
-        ("--max-tokens", args.max_tokens),
-    ):
-        if value < 1:
-            raise core.UsageError(f"{flag} must be at least 1 (got {value})")
-    if args.timeout is not None:
-        cfg.timeout_s = args.timeout
-        core.validate(cfg, "flags")
-    check_mock(cfg, path, args.mock, ui)
-    if not args.mock:
-        require_keys(cfg)
-    outdir = args.out or Path("runs") / f"{stamp()}-fingerprint"
-    prompt_count = min(args.prompt_count, len(cfg.prompts))
-    total = prompt_count * args.reps * len(cfg.targets)
-    ui.header("fingerprint", _models_label(cfg), mock=args.mock)
-    claude = [t.name for t in cfg.targets if t.api == "anthropic"]
-    decoding = "greedy" if not claude else "greedy where allowed (Claude API: sampled)"
-    ui.hint(
-        f"  {_n(len(cfg.targets), 'target')} · {_n(prompt_count, 'prompt')} · {_n(args.reps, 'rep')} · "
-        f"{decoding}, {args.max_tokens} tokens · {total} requests"
-    )
-
-    with Progress(ui, total) as progress:
-        try:
-            report, prints, summary = core.run_fingerprint(
-                cfg,
-                outdir,
-                args.max_tokens,
-                args.reps,
-                prompt_count,
-                args.mock,
-                on_progress=lambda **kw: progress.update(
-                    kw["done"], f"{kw['target']} · {kw['prompt']} · rep {kw['rep'] + 1}"
-                ),
-            )
-        except KeyboardInterrupt:
-            progress.close()
-            path = outdir / "fingerprints.jsonl"
-            kept = len(path.read_text().splitlines()) if path.exists() else 0
-            raise Interrupted(
-                f"interrupted — {kept} fingerprint(s) kept in {outdir}"
-                + (f"; partial report at {outdir}/fingerprint.md" if kept else "")
-            ) from None
-
-    targets = [t.name for t in cfg.targets]
-    print_fingerprint(ui, summary, prints, targets)
-    ui.say()
-    ui.ok(f"wrote {ui.bold(f'{outdir}/fingerprint.md')}  {ui.grey('· fingerprints.jsonl')}")
-
-    any_ok = any(p.ok for p in prints)
-    return {
-        "command": "fingerprint",
-        "ok": any_ok,
-        "mock": args.mock,
-        "run_dir": str(outdir),
-        "report": report,
-        **summary,
-        "exit_code": 0 if any_ok else 4,
-    }
-
-
 # --------------------------------------------------------------------------
 # parser
 # --------------------------------------------------------------------------
@@ -1124,7 +940,6 @@ def build_parser() -> argparse.ArgumentParser:
             "  tps init --model deepseek/deepseek-v4.1-flash\n"
             "  tps doctor\n"
             "  tps run -c targets.toml --reps 7 --concurrency 1,4\n"
-            "  tps fingerprint -c targets.toml\n"
             "\ndocs: https://github.com/teal-sea/tpsbench/tree/main/docs"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1218,16 +1033,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--markdown", action="store_true", help="print report.md instead of tables")
     common(p_rep)
 
-    p_fp = sub.add_parser("fingerprint", help="test whether targets serve the same weights")
-    p_fp.add_argument("-c", "--config", type=Path, default=None)
-    p_fp.add_argument("-o", "--out", type=Path, default=None)
-    p_fp.add_argument("--max-tokens", type=int, default=160)
-    p_fp.add_argument("--reps", type=int, default=2)
-    p_fp.add_argument("--prompt-count", type=int, default=2, help="how many prompts to probe")
-    p_fp.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
-    p_fp.add_argument("--mock", action="store_true", help="synthetic fingerprints, no network")
-    common(p_fp)
-
     return parser
 
 
@@ -1237,7 +1042,6 @@ COMMANDS = {
     "discover": cmd_discover,
     "run": cmd_run,
     "report": cmd_report,
-    "fingerprint": cmd_fingerprint,
 }
 
 

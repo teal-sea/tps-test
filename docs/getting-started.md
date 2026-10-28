@@ -122,19 +122,6 @@ Artifacts land in `runs/<timestamp>/`:
 Re-render anytime: `tps report runs/2026-10-27T12-45-39Z`. Interrupted with
 Ctrl-C? The finished requests are kept and the report is flagged `PARTIAL`.
 
-## 5. Sanity-check the weights
-
-Prices that look impossible usually mean fewer bits. Before trusting a cheap row:
-
-```bash
-tps fingerprint -c targets.toml
-```
-
-Output groups providers by token-level agreement under greedy decoding and ends
-in a verdict. `split` = different artifacts (quantization, revision, or another
-model). Providers whose requests failed are listed as *no data*, never as
-different. See [fingerprinting](fingerprinting.md).
-
 ## Reading the numbers
 
 - **Compare `tok/s` at equal `ttft`.** A provider that returns one token instantly
