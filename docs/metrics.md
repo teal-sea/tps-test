@@ -139,10 +139,19 @@ not quote a p99 from a 7-rep run.
 | `$/1M in`, `$/1M out` | from `price` in the target config |
 | `est. $/1k requests` | `(median_in × price_in + median_out × price_out) × 1000 / 1e6` |
 | `cost of 1M generated tokens` | the same per-request cost scaled to 1M output tokens |
+| `est. $ this run` | Σ over this run's successful requests of `(in_tokens × price_in + out_tokens × price_out) / 1e6` |
 
 Medians are over the lowest-concurrency requests of every prompt. When a provider
 omits `usage.prompt_tokens`, input tokens are estimated as chars/4 of the prompt
 (and flagged), so input spend is never silently dropped.
+
+`est. $ this run` is the one number that answers "what did this benchmark cost
+me". It sums the run's own samples — warm-ups are excluded, failed requests are
+not charged (they have no tokens to bill), and estimated token counts are
+included as estimated. The report prints the total; `--json` exposes it as
+`cost_usd` (with `cost_unpriced` naming targets whose successful requests had no
+`price` block). A
+missing price is *unknown* spend, never $0.
 
 `cost of 1M generated tokens` is the honest cross-provider number, because it
 includes the prompt tokens that produced those outputs. If your workload is

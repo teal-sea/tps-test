@@ -1424,6 +1424,44 @@ def request_cost(
     return per_request * 1000, per_request * (1e6 / out_tokens)
 
 
+def spend(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    """Estimated USD spent on the measured requests, from the configured prices.
+
+    Failed requests aren't charged (there is no token count to bill) and warm-ups
+    are excluded — `batch` is `-1` for those. `total` is None when no measured
+    target carried both prices: that is *unknown*, not free.
+    """
+    prices = {t.get("name"): t for t in meta.get("targets", [])}
+    by_target: dict[str, float] = {}
+    by_prompt: dict[tuple[str, str], float] = {}
+    by_level: dict[tuple[str, str, int], float] = {}
+    unpriced: set[str] = set()
+    for sample in samples:
+        if sample.get("batch") == -1 or not sample.get("ok"):
+            continue
+        name = sample["target"]
+        info = prices.get(name) or {}
+        price_in, price_out = info.get("price_in"), info.get("price_out")
+        if price_in is None or price_out is None:
+            unpriced.add(name)
+            continue
+        amount = (
+            (sample.get("in_tokens") or 0) * price_in + (sample.get("out_tokens") or 0) * price_out
+        ) / 1e6
+        by_target[name] = by_target.get(name, 0.0) + amount
+        key = (sample["prompt"], name)
+        by_prompt[key] = by_prompt.get(key, 0.0) + amount
+        level = (*key, sample.get("concurrency"))
+        by_level[level] = by_level.get(level, 0.0) + amount
+    return {
+        "total": sum(by_target.values()) if by_target else None,
+        "by_target": by_target,
+        "by_prompt": by_prompt,
+        "by_level": by_level,
+        "unpriced": sorted(unpriced),
+    }
+
+
 def fmt(value: float | None, digits: int = 1, scale: float = 1.0) -> str:
     if value is None:
         return "—"
@@ -1650,11 +1688,12 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
     # cost + provenance
     lines.append("## Cost & provenance")
     lines.append("")
+    cost = spend(samples, meta)
     lines.append(
         "| provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens "
-        "| served by | token source |"
+        "| served by | token source | est. $ this run |"
     )
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for target in targets:
         info = price_by_name.get(target, {})
         pin = info.get("pin") or {}
@@ -1668,7 +1707,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
         )
         pinned = ",".join(pin.get("only", [])) if isinstance(pin, dict) else ""
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 target,
                 fmt(info.get("price_in"), 3),
                 fmt(info.get("price_out"), 3),
@@ -1676,8 +1715,29 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                 fmt(per_mtok, 2),
                 ", ".join(served) or (f"pin:{pinned}" if pinned else "—"),
                 ", ".join(source) or "—",
+                fmt(cost["by_target"].get(target), 4),
             )
         )
+    lines.append("")
+    if cost["total"] is not None:
+        line = (
+            f"Estimated spend for this run: **${cost['total']:.4f}** — successful requests "
+            "only, warm-ups excluded, at the configured prices."
+        )
+        if cost["unpriced"]:
+            line += f" No price configured, so not counted: {', '.join(cost['unpriced'])}."
+        lines.append(line)
+    else:
+        line = (
+            "Run spend is unknown: no successful request ran on a target with both "
+            "`price.in_per_1m` and `price.out_per_1m`."
+        )
+        if cost["unpriced"]:
+            line += (
+                f" No price configured, so not counted: {', '.join(cost['unpriced'])}"
+                " — a missing price is not free."
+            )
+        lines.append(line)
     lines.append("")
     lines.append(
         "> Cost uses the median request across all prompts. Provider attribution comes from "
@@ -1743,6 +1803,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                 "itl_n",
                 "tokens_per_chunk_median",
                 "bursty",
+                "cost_usd",
             ]
         )
         for (prompt, target, conc), bucket in sorted(buckets.items()):
@@ -1771,6 +1832,7 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
                     st["itl_n"],
                     fmt(st["tokens_per_chunk_median"], 2),
                     st["bursty"],
+                    fmt(cost["by_level"].get((prompt, target, conc)), 5),
                 ]
             )
 

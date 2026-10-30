@@ -36,10 +36,12 @@ Aggregate rising roughly with `c` means the provider scales; flat aggregate with
 
 ## Cost & provenance
 
-| provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens | served by | token source |
-|---|---|---|---|---|---|---|
-| fast-provider | 0.260 | 0.380 | 0.108 | 0.44 | mock | mock |
-| mid-provider | 0.280 | 0.420 | 0.114 | 0.49 | mock | mock |
-| slow-provider | 0.350 | 0.600 | 0.167 | 0.69 | mock | mock |
+| provider | $/1M in | $/1M out | est. $/1k requests | cost of 1M generated tokens | served by | token source | est. $ this run |
+|---|---|---|---|---|---|---|---|
+| fast-provider | 0.260 | 0.380 | 0.108 | 0.44 | mock | mock | 0.0037 |
+| mid-provider | 0.280 | 0.420 | 0.114 | 0.49 | mock | mock | 0.0041 |
+| slow-provider | 0.350 | 0.600 | 0.167 | 0.69 | mock | mock | 0.0057 |
+
+Estimated spend for this run: **$0.0135** — successful requests only, warm-ups excluded, at the configured prices.
 
 > Cost uses the median request across all prompts. Provider attribution comes from the response (`provider` field or `x-openrouter-provider` header) when the gateway exposes it; if the column is empty you were routed by a gateway, not pinned.

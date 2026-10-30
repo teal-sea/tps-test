@@ -485,6 +485,33 @@ def render_run(ui: UI, summary: dict[str, Any], prompts: list[str]) -> None:
         print_rankings(ui, summary, prompt)
 
 
+def attach_cost(summary: dict[str, Any], cost: dict[str, Any]) -> None:
+    """Put each prompt × target's share of the run spend on its JSON row.
+
+    8 decimals, not 6: a single cheap request can cost less than $1e-6, and a row
+    rounded to 0.0 while the total is non-zero reads like a bug to a consumer.
+    """
+    for row in summary["rows"]:
+        row["cost_usd"] = _r(cost["by_prompt"].get((row["prompt"], row["target"])), 8)
+
+
+def print_spend(ui: UI, cost: dict[str, Any]) -> None:
+    if ui.silent:
+        return
+    if cost["total"] is None:
+        detail = "unknown — no successful request on a target with both prices"
+        if cost["unpriced"]:
+            detail += f" · no price, not counted: {', '.join(cost['unpriced'])}"
+        ui.say()
+        ui.hint(f"  est. spend: {detail}")
+        return
+    detail = f"${cost['total']:.4f} on measured requests · configured prices · warm-ups excluded"
+    if cost["unpriced"]:
+        detail += f" · no price, not counted: {', '.join(cost['unpriced'])}"
+    ui.say()
+    ui.hint(f"  est. spend this run: {detail}")
+
+
 def _wrap(text: str, width: int) -> list[str]:
     import textwrap
 
@@ -982,7 +1009,10 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     rows = [s.as_dict() for s in samples]
     core.write_report(outdir, rows, meta)
     summary = summarise(rows, meta)
+    cost = core.spend(rows, meta)
+    attach_cost(summary, cost)
     render_run(ui, summary, list(cfg.prompts))
+    print_spend(ui, cost)
 
     measured = [s for s in samples if s.phase != "warmup"]
     failed = sum(1 for s in measured if not s.ok)
@@ -1006,6 +1036,8 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "reps": cfg.reps,
         "concurrency": cfg.concurrency,
         "results": summary["rows"],
+        "cost_usd": _r(cost["total"], 8),
+        "cost_unpriced": cost["unpriced"],
         "failed": failed,
         # `total` is measured requests only; raw.jsonl also holds the warm-ups
         "total": len(measured),
@@ -1038,10 +1070,20 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     )
     summary = summarise(samples, meta)
     prompts = list(dict.fromkeys(r["prompt"] for r in summary["rows"]))
+    cost = core.spend(samples, meta)
+    attach_cost(summary, cost)
     render_run(ui, summary, prompts)
+    print_spend(ui, cost)
     ui.say()
     ui.ok(f"rewrote {ui.bold(f'{args.run_dir}/report.md')}  {ui.grey('· summary.csv')}")
-    return {"command": "report", "ok": True, "run_dir": str(args.run_dir), "report": text}
+    return {
+        "command": "report",
+        "ok": True,
+        "run_dir": str(args.run_dir),
+        "cost_usd": _r(cost["total"], 8),
+        "cost_unpriced": cost["unpriced"],
+        "report": text,
+    }
 
 
 def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
@@ -1173,33 +1215,33 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--price", default=None, metavar="IN,OUT", help="USD per 1M tokens")
 
     p_doctor = sub.add_parser("doctor", help="check environment, config and credentials")
-    p_doctor.add_argument("-c", "--config", type=Path, default=None)
+    p_doctor.add_argument("-c", "--config", type=Path, default=None, help="config file")
     p_doctor.add_argument("--network", action="store_true", help="also probe base URLs")
     common(p_doctor)
 
     p_init = sub.add_parser("init", help="scaffold a config")
     endpoint_flags(p_init, "--endpoint")
-    p_init.add_argument("--out", type=Path, default=Path("targets.toml"))
-    p_init.add_argument("--force", action="store_true")
+    p_init.add_argument("--out", type=Path, default=Path("targets.toml"), help="config to write")
+    p_init.add_argument("--force", action="store_true", help="overwrite an existing file")
     common(p_init)
 
     p_disc = sub.add_parser("discover", help="list providers serving a model, with prices")
     p_disc.add_argument("model", help="e.g. deepseek/deepseek-v4.1-flash")
     p_disc.add_argument("--out", type=Path, default=None, help="write a config")
-    p_disc.add_argument("--api-key", default=None)
+    p_disc.add_argument("--api-key", default=None, help="defaults to OPENROUTER_API_KEY")
     p_disc.add_argument("--from-json", type=Path, default=None, help="offline: recorded response")
     p_disc.add_argument("--json-out", type=Path, default=None, help="save the raw API payload")
     common(p_disc)
 
     p_run = sub.add_parser("run", help="measure throughput and latency")
-    p_run.add_argument("-c", "--config", type=Path, default=None)
-    p_run.add_argument("-o", "--out", type=Path, default=None)
+    p_run.add_argument("-c", "--config", type=Path, default=None, help="config file")
+    p_run.add_argument("-o", "--out", type=Path, default=None, help="run directory to create")
     p_run.add_argument(
         "--dry-run", action="store_true", help="print requests, tokens, cost and time; send nothing"
     )
     endpoint_flags(p_run, "--base-url")
-    p_run.add_argument("--reps", type=int, default=None)
-    p_run.add_argument("--concurrency", default=None, help="e.g. 1,4,16")
+    p_run.add_argument("--reps", type=int, default=None, help="reps per target × prompt × level")
+    p_run.add_argument("--concurrency", default=None, help="comma separated levels, e.g. 1,4,16")
     p_run.add_argument("--prompts", default=None, help="comma separated prompt names")
     p_run.add_argument(
         "--max-tokens", type=int, default=None, help="override every prompt's max_tokens"
@@ -1211,19 +1253,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
     p_run.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
-    p_run.add_argument("--no-warmup", action="store_true")
+    p_run.add_argument("--no-warmup", action="store_true", help="skip discarded warm-up requests")
     common(p_run)
 
     p_rep = sub.add_parser("report", help="re-render a previous run")
-    p_rep.add_argument("run_dir", type=Path)
+    p_rep.add_argument("run_dir", type=Path, help="folder printed by `tps run`")
     p_rep.add_argument("--markdown", action="store_true", help="print report.md instead of tables")
     common(p_rep)
 
     p_fp = sub.add_parser("fingerprint", help="test whether targets serve the same weights")
-    p_fp.add_argument("-c", "--config", type=Path, default=None)
-    p_fp.add_argument("-o", "--out", type=Path, default=None)
-    p_fp.add_argument("--max-tokens", type=int, default=160)
-    p_fp.add_argument("--reps", type=int, default=2)
+    p_fp.add_argument("-c", "--config", type=Path, default=None, help="config file")
+    p_fp.add_argument("-o", "--out", type=Path, default=None, help="run directory to create")
+    p_fp.add_argument("--max-tokens", type=int, default=160, help="probe length in tokens")
+    p_fp.add_argument("--reps", type=int, default=2, help="runs per target (2 = noise floor)")
     p_fp.add_argument("--prompt-count", type=int, default=2, help="how many prompts to probe")
     p_fp.add_argument("--timeout", type=float, default=None, help="per-request timeout, seconds")
     p_fp.add_argument("--mock", action="store_true", help="synthetic fingerprints, no network")
