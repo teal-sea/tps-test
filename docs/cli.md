@@ -214,6 +214,7 @@ usage errors name the subcommand in `"command"`.
     "e2e_p50_s": 3.2, "out_tokens_median": 240,
     "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 34, "n": 35, "errors": {"rate_limited": 1},
+    "cost_usd": 0.0511,
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {
       "1": {"ttft_p50_s": 0.42, "out_tps_p50": 78.3, "aggregate_tps": 78.1, "ok": 7, "n": 7, "errors": {}},
@@ -222,6 +223,7 @@ usage errors name the subcommand in `"command"`.
     "count_source": ["usage"], "served_by": ["DeepInfra"],
     "price_in_per_1m": 0.14, "price_out_per_1m": 0.42
   }],
+  "cost_usd": 0.1943, "cost_unpriced": ["together"],
   "failed": 1, "total": 385, "warmup_requests": 22, "planned_requests": 407,
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
@@ -280,6 +282,12 @@ reconciles ITL with tok/s.
 Latency and rate fields describe the lowest concurrency (`concurrency`);
 `ok`/`n`/`errors` count every level; `by_concurrency` breaks both down.
 `out_tps_p90` is the slow tail (see [metrics](metrics.md#percentiles)).
+
+`cost_usd` (per row and in total) is the estimated spend on this run's successful
+requests, at the configured `price`: warm-ups excluded, failures not charged,
+chars/4 token estimates included as estimates. `cost_unpriced` lists targets with
+no `price` — their spend is unknown, not zero. `report --json` returns the same
+`cost_usd`/`cost_unpriced` alongside the markdown.
 
 ### `discover`
 

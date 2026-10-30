@@ -760,6 +760,62 @@ async def main() -> int:
         check(
             "p90 tok/s is the slow tail", core.p90([10, 20, 30, 40, 50], higher_is_better=True) < 20
         )
+        priced = {"targets": [{"name": "local", "price_in": 1.0, "price_out": 2.0}]}
+        bill = core.spend(
+            [
+                {
+                    "target": "local",
+                    "prompt": "p",
+                    "concurrency": 1,
+                    "batch": 0,
+                    "ok": True,
+                    "in_tokens": 1000,
+                    "out_tokens": 1000,
+                },
+                {  # warm-up: measured tokens, but not part of the run's spend
+                    "target": "local",
+                    "prompt": "p",
+                    "concurrency": 1,
+                    "batch": -1,
+                    "ok": True,
+                    "in_tokens": 1000,
+                    "out_tokens": 1000,
+                },
+                {  # failed: no tokens to bill
+                    "target": "local",
+                    "prompt": "p",
+                    "concurrency": 4,
+                    "batch": 0,
+                    "ok": False,
+                    "error": "timeout",
+                },
+            ],
+            priced,
+        )
+        check(
+            "spend counts measured successful requests only",
+            abs((bill["total"] or 0) - 0.003) < 1e-12,
+            str(bill["total"]),
+        )
+        unpriced = core.spend(
+            [
+                {
+                    "target": "local",
+                    "prompt": "p",
+                    "concurrency": 1,
+                    "batch": 0,
+                    "ok": True,
+                    "in_tokens": 10,
+                    "out_tokens": 10,
+                }
+            ],
+            {"targets": [{"name": "local"}]},
+        )
+        check(
+            "a missing price means unknown spend, never zero",
+            unpriced["total"] is None and unpriced["unpriced"] == ["local"],
+            str(unpriced),
+        )
 
         print("fingerprint (same weights vs different artifact):")
         fp_cfg = core.RunConfig(
@@ -1037,6 +1093,31 @@ async def main() -> int:
             > 0,
             str(limited.get("by_concurrency")),
         )
+        check(
+            "run JSON totals the run spend",
+            (payload.get("cost_usd") or 0) > 0,
+            str(payload.get("cost_usd")),
+        )
+        check(
+            "an unpriced target is named, not billed as free",
+            payload.get("cost_unpriced") == ["limited"],
+            str(payload.get("cost_unpriced")),
+        )
+        check(
+            "row costs add up to the run total",
+            abs(
+                sum(r.get("cost_usd") or 0 for r in payload.get("results", []))
+                - (payload.get("cost_usd") or 0)
+            )
+            < 1e-6,
+            str(payload.get("results")),
+        )
+        check(
+            "only priced rows carry a cost",
+            (rows.get("good", {}).get("cost_usd") or 0) > 0
+            and rows.get("limited", {}).get("cost_usd") is None,
+            str({k: v.get("cost_usd") for k, v in rows.items()}),
+        )
         with open(work / "out" / "summary.csv", encoding="utf-8") as handle:
             csv_rows = [r for r in csv.DictReader(handle) if r["provider"] == "good"]
         by_c = {r["concurrency"]: r for r in csv_rows}
@@ -1046,6 +1127,16 @@ async def main() -> int:
             str({c: r.get("n") for c, r in by_c.items()}),
         )
         out_report = (work / "out" / "report.md").read_text(encoding="utf-8")
+        spend_lines = [
+            line
+            for line in out_report.splitlines()
+            if line.startswith("Estimated spend for this run")
+        ]
+        check(
+            "report states the run's spend and names unpriced targets",
+            bool(spend_lines) and "$" in spend_lines[0] and "limited" in spend_lines[0],
+            str(spend_lines),
+        )
         load_rows = [
             line for line in out_report.splitlines() if line.startswith("| good | ") and "×" in line
         ]

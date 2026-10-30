@@ -128,7 +128,9 @@ multiplies it); the built-in filler is only used when `repeat` asks for it.
 
 ## Prices
 
-`price` is only used for the cost columns; it never affects measurement.
+`price` is only used for the cost columns and the run's estimated spend; it never
+affects measurement. A target without both prices is left out of `cost_usd` and
+named in `cost_unpriced` rather than counted as free.
 
 ```toml
 price = { in_per_1m = 0.14, out_per_1m = 0.42 }

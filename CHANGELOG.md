@@ -16,6 +16,9 @@ First public release.
   signature, clusters and a `split` / `consistent` / `inconclusive` verdict.
 - `tps discover` / `tps init --model`: one pinned target per OpenRouter endpoint.
 - `tps doctor`, `tps report` (terminal tables or `--markdown`).
+- Run spend: `est. $ this run` per target in the report, `cost_usd` per row and
+  in total in `--json`, with `cost_unpriced` naming targets that have no `price`
+  (missing price is unknown spend, never $0).
 - `--json` on every command with stable exit codes; partial runs survive Ctrl-C.
 - Redesigned terminal output: boxed tables, best-value highlights, smooth bars,
   heatmap, live progress with ETA. `NO_COLOR` / `FORCE_COLOR` honoured.

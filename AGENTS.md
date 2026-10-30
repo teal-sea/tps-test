@@ -98,11 +98,13 @@ on **stdout** and exit non-zero.
     "e2e_p50_s": 3.2, "out_tokens_median": 240,
     "truncated": 7, "reasoning_only": 0, "hidden_reasoning_tokens_median": null, "notes": [],
     "ok": 35, "n": 35, "errors": {},
+    "cost_usd": 0.0043,
     "aggregate_tps": {"1": 78.1, "4": 240.5},
     "by_concurrency": {"1": {"ok": 7, "n": 7, "...": "..."}, "4": {"ok": 28, "n": 28, "...": "..."}},
     "count_source": ["usage"], "served_by": ["DeepInfra"],
     "price_in_per_1m": 0.14, "price_out_per_1m": 0.42
   }],
+  "cost_usd": 0.0511, "cost_unpriced": [],
   "failed": 0, "total": 385, "warmup_requests": 22, "planned_requests": 407, "mock": false,
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
