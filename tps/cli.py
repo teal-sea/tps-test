@@ -486,17 +486,24 @@ def render_run(ui: UI, summary: dict[str, Any], prompts: list[str]) -> None:
 
 
 def attach_cost(summary: dict[str, Any], cost: dict[str, Any]) -> None:
-    """Put each prompt × target's share of the run spend on its JSON row."""
+    """Put each prompt × target's share of the run spend on its JSON row.
+
+    8 decimals, not 6: a single cheap request can cost less than $1e-6, and a row
+    rounded to 0.0 while the total is non-zero reads like a bug to a consumer.
+    """
     for row in summary["rows"]:
-        row["cost_usd"] = _r(cost["by_prompt"].get((row["prompt"], row["target"])), 6)
+        row["cost_usd"] = _r(cost["by_prompt"].get((row["prompt"], row["target"])), 8)
 
 
 def print_spend(ui: UI, cost: dict[str, Any]) -> None:
     if ui.silent:
         return
     if cost["total"] is None:
+        detail = "unknown — no successful request on a target with both prices"
+        if cost["unpriced"]:
+            detail += f" · no price, not counted: {', '.join(cost['unpriced'])}"
         ui.say()
-        ui.hint("  est. spend: unknown — no target has price.in_per_1m and price.out_per_1m")
+        ui.hint(f"  est. spend: {detail}")
         return
     detail = f"${cost['total']:.4f} on measured requests · configured prices · warm-ups excluded"
     if cost["unpriced"]:
@@ -1029,7 +1036,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "reps": cfg.reps,
         "concurrency": cfg.concurrency,
         "results": summary["rows"],
-        "cost_usd": _r(cost["total"], 6),
+        "cost_usd": _r(cost["total"], 8),
         "cost_unpriced": cost["unpriced"],
         "failed": failed,
         # `total` is measured requests only; raw.jsonl also holds the warm-ups
@@ -1073,7 +1080,7 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "command": "report",
         "ok": True,
         "run_dir": str(args.run_dir),
-        "cost_usd": _r(cost["total"], 6),
+        "cost_usd": _r(cost["total"], 8),
         "cost_unpriced": cost["unpriced"],
         "report": text,
     }

@@ -285,9 +285,10 @@ Latency and rate fields describe the lowest concurrency (`concurrency`);
 
 `cost_usd` (per row and in total) is the estimated spend on this run's successful
 requests, at the configured `price`: warm-ups excluded, failures not charged,
-chars/4 token estimates included as estimates. `cost_unpriced` lists targets with
-no `price` — their spend is unknown, not zero. `report --json` returns the same
-`cost_usd`/`cost_unpriced` alongside the markdown.
+chars/4 token estimates included as estimates. `cost_unpriced` lists targets whose
+successful requests had no `price` — their spend is unknown, not zero. `report --json`
+returns the same `cost_usd`/`cost_unpriced` alongside the markdown. This is what the
+run *used*; `run --dry-run` estimates an upper bound *before* it starts.
 
 ### `discover`
 

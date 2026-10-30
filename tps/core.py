@@ -1728,10 +1728,16 @@ def write_report(run_dir: Path, samples: list[dict[str, Any]], meta: dict[str, A
             line += f" No price configured, so not counted: {', '.join(cost['unpriced'])}."
         lines.append(line)
     else:
-        lines.append(
-            "Run spend is unknown: no measured target has both `price.in_per_1m` and "
-            "`price.out_per_1m` (missing price is not free)."
+        line = (
+            "Run spend is unknown: no successful request ran on a target with both "
+            "`price.in_per_1m` and `price.out_per_1m`."
         )
+        if cost["unpriced"]:
+            line += (
+                f" No price configured, so not counted: {', '.join(cost['unpriced'])}"
+                " — a missing price is not free."
+            )
+        lines.append(line)
     lines.append("")
     lines.append(
         "> Cost uses the median request across all prompts. Provider attribution comes from "
